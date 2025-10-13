@@ -1,0 +1,34 @@
+[package]
+name = "cleanslate"
+version = "0.1.0"
+edition = "2021"
+authors = ["Oliver Steele <osteele@github.com>"]
+description = "A tool to identify and clean build artifacts and caches from various programming languages"
+
+[dependencies]
+walkdir = "2.4.0"
+clap = { version = "4.4.8", features = ["derive"] }
+ignore = "0.4.20"
+anyhow = "1.0.75"
+humansize = "2.1.3"
+colored = "2.0.4"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8.0"
+
+[dev-dependencies]
+tempfile = "3.10.1"
+assert_cmd = "2.0.14"
+predicates = "3.1.0"
+cargo-husky = { version = "1.5.0", features = ["precommit-hook", "run-cargo-test", "run-cargo-clippy", "run-cargo-fmt"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+# Enable high optimizations for dependencies (but not for our code):
+[profile.dev.package."*"]
+opt-level = 3

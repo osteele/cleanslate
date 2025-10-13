@@ -1,0 +1,238 @@
+# Artifact patterns for cleanslate
+# Organized by language/tool and artifact type
+#
+# Naming convention:
+# - Patterns starting with a slash (e.g., "/build") only match at the project root level
+# - Patterns without a slash (e.g., "node_modules") match anywhere in the path
+# - Patterns with wildcards (e.g., "*.pyc") use simple glob matching
+#
+# Special case: The ".git" directory is hardcoded to be ignored in the traversal
+
+# General build artifacts that apply to most languages/tools
+[general]
+name = "General"
+
+[general.build]
+patterns = [
+  "/build",
+  "/dist",
+  "target",
+  "/out",
+  "/bin",
+  "coverage"
+]
+
+[general.temp]
+patterns = [
+  ".DS_Store",
+  "Thumbs.db",
+  "/tmp",
+  "tmp",
+  "/temp",
+  "temp",
+  ".tmp",
+  ".temp",
+  "__MACOSX",
+  "*.bak",
+  "*.swp",
+  "*~"
+]
+
+[general.logs]
+patterns = [
+  "/log",
+  "log",
+  "/logs",
+  "logs"
+]
+
+[general.ide]
+patterns = [
+  ".vscode",
+  ".idea",
+  "*.iml",
+  ".project",
+  ".classpath",
+  ".settings"
+]
+
+# Python artifacts
+[python]
+name = "Python"
+
+[python.cache]
+patterns = [
+  "__pycache__",
+  ".pytest_cache",
+  ".coverage",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".pyright_cache",
+  ".tox",
+  ".nox",
+  ".eggs",
+  ".ipynb_checkpoints"
+]
+
+[python.dependencies]
+patterns = [
+  ".venv",
+  "venv",
+  "env"
+]
+
+[python.build]
+patterns = [
+  "*.egg-info"
+]
+
+[python.intermediate]
+patterns = [
+  "*.pyc",
+  "*.pyo",
+  "*.pyd",
+  "*$py.class"
+]
+
+# JavaScript/TypeScript artifacts
+[javascript]
+name = "JavaScript/TypeScript"
+
+[javascript.dependencies]
+patterns = [
+  "node_modules"
+]
+
+[javascript.cache]
+patterns = [
+  ".npm",
+  ".cache",
+  ".parcel-cache",
+  ".vite-cache",
+  ".rollup-cache",
+  ".eslintcache",
+  ".prettiercache",
+  ".stylelintcache",
+  ".turbo"
+]
+
+[javascript.build]
+patterns = [
+  ".next",
+  ".nuxt",
+  ".svelte-kit"
+]
+
+[javascript.logs]
+patterns = [
+  "npm-debug.log*",
+  "yarn-debug.log*",
+  "yarn-error.log",
+  "yarn-error.log*",
+  ".pnpm-debug.log*"
+]
+
+# Rust artifacts
+[rust]
+name = "Rust"
+
+[rust.cache]
+patterns = [
+  ".cargo"
+]
+
+[rust.build]
+patterns = [
+  "Cargo.lock"
+]
+
+# Go artifacts
+[go]
+name = "Go"
+
+[go.build]
+patterns = [
+  "/vendor"
+]
+
+# Java/JVM artifacts
+[java]
+name = "Java/JVM"
+
+[java.build]
+patterns = [
+  "/classes"
+]
+
+[java.dependencies]
+patterns = [
+  ".gradle",
+  ".m2"
+]
+
+# C/C++ artifacts
+[c_cpp]
+name = "C/C++"
+
+[c_cpp.build]
+patterns = [
+  "*.o",
+  "*.obj",
+  "*.a",
+  "*.lib",
+  "*.so",
+  "*.dll",
+  "*.dylib",
+  "CMakeFiles",
+  "cmake-build-*"
+]
+
+# Swift/Xcode artifacts
+[swift]
+name = "Swift/Xcode"
+
+[swift.build]
+patterns = [
+  "*.xcworkspace/xcuserdata",
+  "*.xcodeproj/xcuserdata",
+  "DerivedData",
+  ".build"
+]
+
+# Ruby artifacts
+[ruby]
+name = "Ruby"
+
+[ruby.build]
+patterns = [
+  "*.gem"
+]
+
+[ruby.dependencies]
+patterns = [
+  ".bundle",
+  "vendor/bundle",
+  "bin",
+  "vendor"
+]
+
+# Dart/Flutter artifacts
+[dart]
+name = "Dart/Flutter"
+
+[dart.cache]
+patterns = [
+  ".dart_tool",
+  ".pub-cache",
+  ".flutter-plugins"
+]
+
+# Haskell artifacts
+[haskell]
+name = "Haskell"
+
+[haskell.build]
+patterns = [
+  ".stack-work",
+  "dist-newstyle"
+]
