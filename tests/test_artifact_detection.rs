@@ -1,4 +1,4 @@
-use crate::main::{is_artifact, get_artifact_patterns, ArtifactPattern};
+use crate::main::{get_artifact_patterns, is_artifact, ArtifactPattern};
 use std::path::Path;
 
 #[path = "../src/main.rs"]

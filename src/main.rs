@@ -46,7 +46,6 @@ struct ArtifactEntry {
 }
 
 struct ProjectReport {
-    project_dir: PathBuf,
     artifacts: Vec<ArtifactEntry>,
 }
 
@@ -165,31 +164,21 @@ pub fn get_artifact_patterns() -> Result<Vec<ArtifactPattern>> {
 /// Check if a path is an artifact based on the patterns
 /// Uses a whitelist approach - only returns true for paths that explicitly match known artifact patterns
 pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
-    let path_str = path.to_string_lossy();
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy())
         .unwrap_or_default();
 
-
     // Now apply whitelist pattern matching - ONLY return true if we match a known artifact pattern
     for pattern in patterns {
         // Handle patterns that need context (starting with /)
         if pattern.needs_context {
-            // Split the path into components
-            let components: Vec<_> = path.components().collect();
-
-            // If the pattern needs context (root-level match), ensure we're matching at the project root
-            if components.len() <= 2 {
-                // We're at or near project root, the pattern should match here
-                let parent_str = path.parent().unwrap_or(path).to_string_lossy();
-                if parent_str.ends_with('/') || parent_str.ends_with('\\') {
-                    if filename == pattern.pattern {
-                        return true;
-                    }
-                } else {
-                    // Handle case with no trailing slash
-                    if format!("{}/{}", parent_str, pattern.pattern) == path_str {
+            // For root-scoped patterns, we need to check if the filename matches
+            // and if the parent directory is a project root
+            if filename == pattern.pattern {
+                // Check if parent is a project root
+                if let Some(parent) = path.parent() {
+                    if is_project_root(parent) {
                         return true;
                     }
                 }
@@ -199,28 +188,58 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
 
         // Check different pattern types
         if let Some(suffix) = pattern.pattern.strip_prefix('*') {
-            if path_str.ends_with(suffix) {
+            // Match against filename for suffix patterns (e.g., *.pyc)
+            if filename.ends_with(suffix) {
                 return true;
             }
         } else if pattern.pattern.contains('*') {
-            // Handle glob patterns
+            // Handle glob patterns - match against filename only
             let parts: Vec<&str> = pattern.pattern.split('*').collect();
-            if parts.len() == 2 && path_str.starts_with(parts[0]) && path_str.ends_with(parts[1]) {
-                return true;
+            if parts.len() == 2 {
+                let filename_str = filename.to_string();
+                if filename_str.starts_with(parts[0]) && filename_str.ends_with(parts[1]) {
+                    return true;
+                }
             }
         } else if filename == pattern.pattern {
             // Exact filename match
             return true;
-        } else if path_str.ends_with(&format!("/{}", pattern.pattern)) {
-            // Directory match at any level
-            return true;
-        } else if path_str.contains(&pattern.pattern) {
-            // Substring match for path
-            return true;
+        } else {
+            // Component-based matching: check if pattern matches any path component
+            // This prevents false positives like "logs" matching "/catalogs/"
+            if path.components().any(|c| {
+                if let std::path::Component::Normal(os_str) = c {
+                    os_str.to_string_lossy() == pattern.pattern
+                } else {
+                    false
+                }
+            }) {
+                return true;
+            }
         }
     }
 
     // Default to false - only explicit matches are considered artifacts
+    false
+}
+
+/// Helper function to check if a path is a project root
+fn is_project_root(path: &Path) -> bool {
+    let indicators = [
+        "Cargo.toml",     // Rust
+        "pyproject.toml", // Python
+        "package.json",   // JavaScript/Node
+        "go.mod",         // Go
+        ".git",           // Generic project indicator
+        ".jj",            // Jujutsu VCS
+    ];
+
+    for indicator in &indicators {
+        if path.join(indicator).exists() {
+            return true;
+        }
+    }
+
     false
 }
 
@@ -232,18 +251,26 @@ fn calculate_dir_size(path: &Path) -> Result<u64> {
         return Ok(0);
     }
 
-    if path.is_file() {
-        match fs::metadata(path) {
-            Ok(metadata) => return Ok(metadata.len()),
-            Err(err) => {
-                eprintln!(
-                    "Warning: Could not get metadata for {}: {}",
-                    path.display(),
-                    err
-                );
-                return Ok(0);
-            }
+    // Use symlink_metadata to avoid following symlinks
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            eprintln!(
+                "Warning: Could not get metadata for {}: {}",
+                path.display(),
+                err
+            );
+            return Ok(0);
         }
+    };
+
+    // Skip symlinks entirely - don't follow them or count their size
+    if metadata.is_symlink() {
+        return Ok(0);
+    }
+
+    if metadata.is_file() {
+        return Ok(metadata.len());
     }
 
     let read_dir_result = match fs::read_dir(path) {
@@ -273,19 +300,28 @@ fn calculate_dir_size(path: &Path) -> Result<u64> {
 
         let entry_path = entry.path();
 
-        if entry_path.is_dir() {
+        // Use symlink_metadata to check if this entry is a symlink
+        let entry_metadata = match fs::symlink_metadata(&entry_path) {
+            Ok(meta) => meta,
+            Err(err) => {
+                eprintln!(
+                    "Warning: Could not get metadata for {}: {}",
+                    entry_path.display(),
+                    err
+                );
+                continue;
+            }
+        };
+
+        // Skip symlinks - don't recurse into them or count their size
+        if entry_metadata.is_symlink() {
+            continue;
+        }
+
+        if entry_metadata.is_dir() {
             total += calculate_dir_size(&entry_path).unwrap_or(0);
         } else {
-            match entry.metadata() {
-                Ok(metadata) => total += metadata.len(),
-                Err(err) => {
-                    eprintln!(
-                        "Warning: Could not get metadata for {}: {}",
-                        entry_path.display(),
-                        err
-                    );
-                }
-            }
+            total += entry_metadata.len();
         }
     }
 
@@ -346,14 +382,12 @@ fn scan_for_artifacts(
             println!("DEBUG: Scanning directory {}", start_path.display());
             println!("DEBUG: Directory contents:");
             if let Ok(entries) = fs::read_dir(&start_path) {
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        println!("  > {}", entry.path().display());
-                    }
+                for entry in entries.flatten() {
+                    println!("  > {}", entry.path().display());
                 }
             }
         }
-        
+
         let walker = WalkBuilder::new(&start_path)
             .hidden(false) // Include hidden files/dirs by default
             .git_ignore(true)
@@ -377,11 +411,12 @@ fn scan_for_artifacts(
             if verbose {
                 println!("DEBUG: Checking path: {}", path.display());
             }
-                
+
             // Check if the path is an artifact
             // Pass patterns as a slice
             if is_artifact(path, &patterns) {
-                let metadata = match entry.metadata() {
+                // Use symlink_metadata to avoid following symlinks
+                let metadata = match fs::symlink_metadata(path) {
                     Ok(meta) => meta,
                     Err(err) => {
                         eprintln!(
@@ -392,6 +427,14 @@ fn scan_for_artifacts(
                         continue;
                     }
                 };
+
+                // Skip symlinks entirely - don't delete them or their targets
+                if metadata.is_symlink() {
+                    if verbose {
+                        println!("Skipping symlink: {}", path.display());
+                    }
+                    continue;
+                }
 
                 let size = if metadata.is_file() {
                     metadata.len()
@@ -410,12 +453,11 @@ fn scan_for_artifacts(
                 total_bytes += size;
                 _total_files += 1;
 
-                let project_report = projects
-                    .entry(project_root.clone())
-                    .or_insert_with(|| ProjectReport {
-                        project_dir: project_root.clone(),
+                let project_report = projects.entry(project_root.clone()).or_insert_with(|| {
+                    ProjectReport {
                         artifacts: Vec::new(),
-                    });
+                    }
+                });
 
                 let removed = if delete {
                     if dry_run {
@@ -435,11 +477,7 @@ fn scan_for_artifacts(
                                 true
                             }
                             Err(err) => {
-                                eprintln!(
-                                    "Error removing {}: {}. Skipping.",
-                                    path.display(),
-                                    err
-                                );
+                                eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
                                 false
                             }
                         }
@@ -472,27 +510,28 @@ fn scan_for_artifacts(
             }
         };
 
-        for entry_result in read_dir_result {
-            if let Ok(entry) = entry_result {
-                let path = entry.path();
-                if path.is_file() {
-                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                        let path_str = path.to_string_lossy();
-                        // Find the pattern that matches this file
-                        // Iterate over &ArtifactPattern
-                        if let Some(matching_pattern) = patterns
+        for entry in read_dir_result.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                    let path_str = path.to_string_lossy();
+                    // Find the pattern that matches this file
+                    // Iterate over &ArtifactPattern
+                    if let Some(matching_pattern) = patterns
+                        .iter()
+                        .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
+                    {
+                        // Check if the artifact type suggests a language
+                        let artifact_type: Option<ArtifactType> = patterns
                             .iter()
                             .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-                        {
-                            // Check if the artifact type suggests a language
-                            let artifact_type: Option<ArtifactType> = patterns
-                                .iter()
-                                .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-                                .map(|p| p.artifact_type); // Access artifact_type field directly
-                            if let Some(atype) = artifact_type {
-                                if !matches!(atype, ArtifactType::Temp | ArtifactType::Logs | ArtifactType::IDE) {
-                                    detected_languages.insert(matching_pattern.language_name.clone());
-                                }
+                            .map(|p| p.artifact_type); // Access artifact_type field directly
+                        if let Some(atype) = artifact_type {
+                            if !matches!(
+                                atype,
+                                ArtifactType::Temp | ArtifactType::Logs | ArtifactType::IDE
+                            ) {
+                                detected_languages.insert(matching_pattern.language_name.clone());
                             }
                         }
                     }
@@ -507,12 +546,15 @@ fn scan_for_artifacts(
         println!("No artifacts found.");
     } else {
         for (project_dir, report) in &projects {
-            let project_name = project_dir.file_name().unwrap_or_default().to_string_lossy();
+            let project_name = project_dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy();
             let project_path_display = project_dir.display();
             let total_project_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
 
             // Detect languages for this project
-            let languages = detect_project_languages(&project_dir, &patterns); // Pass patterns slice
+            let languages = detect_project_languages(project_dir, &patterns); // Pass patterns slice
             let language_str = if languages.is_empty() {
                 String::new()
             } else {
@@ -523,9 +565,7 @@ fn scan_for_artifacts(
                 "{}",
                 format!(
                     "Project: {} ({}){}",
-                    project_name,
-                    project_path_display,
-                    language_str
+                    project_name, project_path_display, language_str
                 )
                 .bold()
             );
@@ -550,26 +590,26 @@ fn scan_for_artifacts(
                         .unwrap_or_default();
 
                     // Find the matching pattern to get the language
-                     // Iterate over &ArtifactPattern
+                    // Iterate over &ArtifactPattern
                     if let Some(matching_pattern) = patterns
                         .iter()
                         .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
                     {
-                        *project_language_summary.entry(matching_pattern.language_name.clone()).or_insert(0) += artifact.size;
+                        *project_language_summary
+                            .entry(matching_pattern.language_name.clone())
+                            .or_insert(0) += artifact.size;
                         // Also update global language counts
                         let language_map = language_counts
                             .entry(matching_pattern.artifact_type) // Access artifact_type field directly
-                            .or_insert_with(HashMap::new);
-                        language_map.entry(path.to_path_buf()).or_insert(matching_pattern.language_name.clone()); // Access language_name field directly
+                            .or_default();
+                        language_map
+                            .entry(path.to_path_buf())
+                            .or_insert(matching_pattern.language_name.clone()); // Access language_name field directly
                     }
                 }
 
                 for (language, size) in project_language_summary {
-                    println!(
-                        "  - {}: {}",
-                        language,
-                        format_size(size, BINARY)
-                    );
+                    println!("  - {}: {}", language, format_size(size, BINARY));
                 }
             }
 

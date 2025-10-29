@@ -10,10 +10,10 @@ fn setup_test_directory() -> tempfile::TempDir {
     fs::create_dir_all(dir.path().join("node_modules")).unwrap();
     fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
     fs::create_dir_all(dir.path().join("target")).unwrap();
-    
+
     // Write a dummy file to verify the directory
     fs::write(dir.path().join("test_file.txt"), "This is a test").unwrap();
-    
+
     // Print debug info
     println!("Created test directory at: {}", dir.path().display());
     println!("Directory contents:");
