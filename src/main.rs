@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, short)]
     files: bool,
 
-    /// Show rm commands that would be run, but don't execute them
+    /// Show what would be deleted without actually deleting (implies --delete)
     #[arg(long)]
     dry_run: bool,
 }
@@ -328,6 +328,80 @@ fn calculate_dir_size(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
+/// Check if a path is tracked in git by running git ls-files
+/// Returns true if the file is tracked in version control
+fn is_tracked_in_git(path: &Path) -> bool {
+    use std::process::Command;
+
+    // Find the git repository root
+    let git_root = Command::new("git")
+        .arg("rev-parse")
+        .arg("--show-toplevel")
+        .current_dir(path.parent().unwrap_or(path))
+        .output();
+
+    let git_root = match git_root {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => return false, // Not in a git repo
+    };
+
+    // Check if the file is tracked
+    let output = Command::new("git")
+        .arg("ls-files")
+        .arg("--error-unmatch")
+        .arg(path)
+        .current_dir(&git_root)
+        .output();
+
+    match output {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Similar check for jj (Jujutsu)
+fn is_tracked_in_jj(path: &Path) -> bool {
+    use std::process::Command;
+
+    // Check if file is tracked in jj
+    let output = Command::new("jj")
+        .arg("file")
+        .arg("list")
+        .arg(path)
+        .output();
+
+    match output {
+        Ok(output) => output.status.success() && !output.stdout.is_empty(),
+        Err(_) => false,
+    }
+}
+
+/// Check if a path is tracked in version control (git or jj)
+fn is_tracked_in_vcs(path: &Path) -> bool {
+    // First check if this is a file (tracked files must be files, not directories)
+    if !path.is_file() {
+        return false;
+    }
+
+    // Check jj first (since projects using jj also have .git)
+    if path.ancestors().any(|p| p.join(".jj").exists()) {
+        if is_tracked_in_jj(path) {
+            return true;
+        }
+    }
+
+    // Then check git
+    if path.ancestors().any(|p| p.join(".git").exists()) {
+        if is_tracked_in_git(path) {
+            return true;
+        }
+    }
+
+    false
+}
+
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     let indicators = [
         "Cargo.toml",     // Rust
@@ -337,20 +411,30 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
         ".git",           // Generic project indicator
     ];
 
-    let mut current = Some(path);
+    // Start from the parent if path is a file
+    let mut current = if path.is_file() {
+        path.parent()
+    } else {
+        Some(path)
+    };
 
-    while let Some(path) = current {
+    while let Some(p) = current {
         for indicator in &indicators {
-            if path.join(indicator).exists() {
-                return Some(path.to_path_buf());
+            if p.join(indicator).exists() {
+                return Some(p.to_path_buf());
             }
         }
 
-        current = path.parent();
+        current = p.parent();
     }
 
-    // If we couldn't determine a project root, return the original path
-    Some(path.to_path_buf())
+    // If we couldn't determine a project root, return the parent directory
+    // Never return a file path as a project root
+    if path.is_file() {
+        path.parent().map(|p| p.to_path_buf())
+    } else {
+        Some(path.to_path_buf())
+    }
 }
 
 fn scan_for_artifacts(
@@ -364,6 +448,7 @@ fn scan_for_artifacts(
     let mut _total_files: u64 = 0;
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut language_counts: HashMap<ArtifactType, HashMap<PathBuf, String>> = HashMap::new();
+    let mut skip_paths: HashSet<PathBuf> = HashSet::new(); // Paths to skip (artifact dirs we've already processed)
 
     // Load patterns once
     let patterns = get_artifact_patterns().context("Failed to load artifact patterns")?;
@@ -404,6 +489,31 @@ fn scan_for_artifacts(
 
             let path = entry.path();
 
+            // Never process the scan root itself as an artifact
+            if path == start_path.as_path() {
+                continue;
+            }
+
+            // Skip VCS directories (version control internals)
+            // This matches the common VCS directories that tools like Mutagen and Syncthing skip
+            if path.components().any(|c| {
+                if let std::path::Component::Normal(name) = c {
+                    matches!(
+                        name.to_str().unwrap_or(""),
+                        ".git" | ".jj" | ".svn" | ".hg" | ".bzr" | "_darcs" | ".pijul" | "CVS" | ".fossil"
+                    )
+                } else {
+                    false
+                }
+            }) {
+                continue;
+            }
+
+            // Skip if this path is inside an artifact directory we've already processed
+            if skip_paths.iter().any(|skip| path.starts_with(skip)) {
+                continue;
+            }
+
             // Try to find project root, default to start_path if not found
             let project_root = find_project_root(path).unwrap_or_else(|| start_path.clone());
 
@@ -415,6 +525,14 @@ fn scan_for_artifacts(
             // Check if the path is an artifact
             // Pass patterns as a slice
             if is_artifact(path, &patterns) {
+                // Skip files that are tracked in version control
+                if is_tracked_in_vcs(path) {
+                    if verbose {
+                        println!("Skipping tracked file: {}", path.display());
+                    }
+                    continue;
+                }
+
                 // Use symlink_metadata to avoid following symlinks
                 let metadata = match fs::symlink_metadata(path) {
                     Ok(meta) => meta,
@@ -434,6 +552,11 @@ fn scan_for_artifacts(
                         println!("Skipping symlink: {}", path.display());
                     }
                     continue;
+                }
+
+                // If this is a directory artifact, add it to skip_paths so we don't process its contents
+                if metadata.is_dir() {
+                    skip_paths.insert(path.to_path_buf());
                 }
 
                 let size = if metadata.is_file() {
@@ -459,7 +582,7 @@ fn scan_for_artifacts(
                     }
                 });
 
-                let removed = if delete {
+                let removed = if delete || dry_run {
                     if dry_run {
                         println!("Would remove: {}", path.display());
                         false // Not actually removed in dry run
@@ -483,7 +606,7 @@ fn scan_for_artifacts(
                         }
                     }
                 } else {
-                    false // Not removed if delete flag is false
+                    false // Not removed if neither delete nor dry_run
                 };
 
                 project_report.artifacts.push(ArtifactEntry {

@@ -16,11 +16,61 @@ A command-line tool that recursively examines directories to find and optionally
 
 CleanSlate identifies common artifacts from:
 
-- Python (`__pycache__`, `.pytest_cache`, etc.)
-- JavaScript/TypeScript (`node_modules`, `.next`, `dist`, etc.)
-- Rust (`target`, etc.)
-- Go (`bin`, `pkg`, `vendor`, etc.)
-- General artifacts (`.DS_Store`, `Thumbs.db`, etc.)
+- **Python**: `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.venv`, `*.pyc`, `*.egg-info`, etc.
+- **JavaScript/TypeScript**: `node_modules`, `.next`, `.nuxt`, `.svelte-kit`, `.npm`, `.cache`, etc.
+- **Rust**: `.cargo` cache
+- **Go**: `/vendor` (at project root)
+- **Ruby**: `.bundle`, `vendor/bundle`
+- **Swift/Xcode**: `DerivedData`, `/.build`, `*.xcworkspace/xcuserdata`
+- **Java/JVM**: `.gradle`, `.m2`, `/classes`
+- **C/C++**: `*.o`, `*.so`, `*.dll`, `CMakeFiles`, etc.
+- **Dart/Flutter**: `.dart_tool`, `.pub-cache`
+- **Haskell**: `.stack-work`, `dist-newstyle`
+- **General**: `.DS_Store`, `Thumbs.db`, `tmp`, `logs`, `.idea`, etc.
+
+## Pattern Syntax
+
+CleanSlate uses a pattern system defined in `artifacts.toml`. Understanding the pattern syntax helps you know what will be detected:
+
+### Pattern Types
+
+1. **Root-level patterns** (with `/` prefix): Only match at project root
+   - Example: `/build` matches `<project-root>/build` but NOT `<project-root>/src/build`
+   - Used for: `/target`, `/dist`, `/out`, `/bin`, `/coverage`, `/vendor`, etc.
+
+2. **Anywhere patterns** (no `/` prefix): Match at any depth
+   - Example: `tmp` matches any directory named `tmp` anywhere in the tree
+   - Used for: `node_modules`, `__pycache__`, `tmp`, `logs`, `.DS_Store`, etc.
+
+3. **Wildcard patterns**: Simple glob matching
+   - Example: `*.pyc` matches any file ending in `.pyc`
+   - Example: `yarn-*.log` matches `yarn-debug.log`, `yarn-error.log`, etc.
+
+### Project Root Detection
+
+CleanSlate determines project roots by looking for:
+- `Cargo.toml` (Rust)
+- `pyproject.toml` (Python)
+- `package.json` (JavaScript/Node)
+- `go.mod` (Go)
+- `.git` (Git repository)
+- `.jj` (Jujutsu repository)
+
+This ensures that `/build` patterns only match at the actual project root, not in subdirectories.
+
+## Safety Features
+
+- **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
+- **VCS Directory Skip**: Never scans inside version control directories (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
+- **Respects `.gitignore`**: Uses gitignore patterns to skip files
+- **Symlink Safe**: Never follows or deletes symlinks
+- **Dry Run Mode**: Use `--dry-run` to see what would be deleted without actually deleting
+
+## Important Notes
+
+- **Cargo.lock**: Not treated as an artifact (correctly committed for binary projects)
+- **.vscode**: Not treated as an artifact (teams often commit IDE settings)
+- **node_modules**: Matches anywhere (supports monorepos with nested packages)
 
 ## Installation
 
