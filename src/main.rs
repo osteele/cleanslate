@@ -70,6 +70,10 @@ struct Args {
     /// Aggressive mode: also remove small/trivial files like .DS_Store
     #[arg(long)]
     aggressive: bool,
+
+    /// Exclude directories by name (can be specified multiple times)
+    #[arg(long, short = 'x', value_name = "DIR")]
+    exclude: Vec<String>,
 }
 
 struct ArtifactEntry {
@@ -713,6 +717,25 @@ fn truncate_name_with_suffix(name: &str, max_width: usize) -> String {
     }
 }
 
+/// Check if a path should be excluded based on directory name matching
+fn should_exclude_path(path: &Path, excludes: &[String]) -> bool {
+    if excludes.is_empty() {
+        return false;
+    }
+
+    // Check each component of the path
+    for component in path.components() {
+        if let std::path::Component::Normal(name) = component {
+            let dir_name = name.to_string_lossy();
+            if excludes.iter().any(|exclude| exclude == dir_name.as_ref()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     let indicators = [
         "Cargo.toml",     // Rust
@@ -968,6 +991,7 @@ fn scan_single_path(
     verbose: bool,
     dry_run: bool,
     list: bool,
+    exclude: &[String],
 ) -> Result<ScanResult> {
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut skip_paths: HashSet<PathBuf> = HashSet::new();
@@ -1014,6 +1038,21 @@ fn scan_single_path(
                 false
             }
         }) {
+            continue;
+        }
+
+        // Skip excluded directories (user-specified)
+        // Only exclude directories, not files with matching names
+        if entry.file_type().map_or(false, |ft| ft.is_dir()) && should_exclude_path(path, exclude) {
+            if verbose {
+                println!("DEBUG: Skipping excluded directory: {}", path.display());
+            }
+            // Skip traversing into this directory for performance
+            if let Err(e) = entry.skip_current_dir() {
+                if verbose {
+                    eprintln!("DEBUG: Failed to skip directory {}: {}", path.display(), e);
+                }
+            }
             continue;
         }
 
@@ -1106,6 +1145,7 @@ fn scan_for_artifacts(
     dry_run: bool,
     list: bool,
     aggressive: bool,
+    exclude: Vec<String>,
 ) -> Result<()> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
@@ -1137,7 +1177,7 @@ fn scan_for_artifacts(
     // Scan paths in parallel
     let results: Vec<ScanResult> = unique_paths
         .par_iter()
-        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list))
+        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list, &exclude))
         .collect::<Result<Vec<_>>>()?;
 
     // Merge results from parallel scans
@@ -1574,6 +1614,7 @@ fn main() -> Result<()> {
         args.dry_run,
         args.list,
         args.aggressive,
+        args.exclude,
     )?;
 
     Ok(())
