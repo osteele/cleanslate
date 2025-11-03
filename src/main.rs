@@ -701,6 +701,18 @@ fn calculate_total_dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Truncate an artifact name with "..." suffix if it exceeds max_width
+fn truncate_name_with_suffix(name: &str, max_width: usize) -> String {
+    if name.len() <= max_width {
+        name.to_string()
+    } else if max_width >= 3 {
+        let truncate_to = max_width.saturating_sub(3);
+        format!("{}...", &name[..truncate_to])
+    } else {
+        "...".to_string()
+    }
+}
+
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     let indicators = [
         "Cargo.toml",     // Rust
@@ -1375,8 +1387,23 @@ fn scan_for_artifacts(
                     formatted.len() + 2 // ", " separator
                 };
 
-                if current_len + add_len + 3 > what_width { // +3 for "..."
-                    what_parts.push("...".to_string());
+                if current_len + add_len > what_width {
+                    // Try to fit a truncated version of the current artifact
+                    let separator_len = if what_parts.is_empty() { 0 } else { 2 }; // ", "
+                    let remaining_width = what_width.saturating_sub(current_len + separator_len);
+
+                    if remaining_width >= 6 { // Minimum for showing something useful (e.g., "foo...")
+                        let truncated = truncate_name_with_suffix(name, remaining_width);
+                        let truncated_formatted = if *size > large_threshold {
+                            truncated.bold().to_string()
+                        } else {
+                            truncated
+                        };
+                        what_parts.push(truncated_formatted);
+                    } else if !what_parts.is_empty() {
+                        // Not enough room for partial name, just add "..." if we have previous items
+                        what_parts.push("...".to_string());
+                    }
                     break;
                 }
 
