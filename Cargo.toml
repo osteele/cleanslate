@@ -1,6 +1,6 @@
 [package]
 name = "cleanslate"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["Oliver Steele <osteele@github.com>"]
 description = "A tool to identify and clean build artifacts and caches from various programming languages"
