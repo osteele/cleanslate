@@ -27,6 +27,7 @@ use clap::Parser;
 use colored::Colorize;
 use humansize::{format_size, BINARY};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
@@ -183,6 +184,28 @@ const RECREATABLE_DIRS: &[&str] = &[
     ".turbo",
 ];
 
+/// Helper function to check if a path matches any recreatable directory pattern
+fn is_recreatable_dir(path: &Path) -> bool {
+    // Get the directory name for simple comparisons
+    let dir_name = path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+
+    for pattern in RECREATABLE_DIRS {
+        if pattern.contains('/') {
+            // Multi-component pattern like "vendor/bundle"
+            if matches_path_suffix(path, pattern) {
+                return true;
+            }
+        } else if *pattern == dir_name {
+            // Simple exact match
+            return true;
+        }
+    }
+
+    false
+}
+
 /// VCS internal directories that should never be traversed or removed.
 /// See docs/architecture.md for detailed explanation of the three directory categories.
 const VCS_INTERNALS: &[&str] = &[
@@ -303,7 +326,16 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
             continue;
         }
 
-        // Check different pattern types
+        // Check if pattern contains a slash (multi-component pattern)
+        if pattern.pattern.contains('/') {
+            // Multi-component pattern like "vendor/bundle" or "*.xcworkspace/xcuserdata"
+            if matches_path_suffix(path, &pattern.pattern) {
+                return true;
+            }
+            continue;
+        }
+
+        // Single-component patterns - check different pattern types
         if let Some(suffix) = pattern.pattern.strip_prefix('*') {
             // Match against filename for suffix patterns (e.g., *.pyc)
             if filename.ends_with(suffix) {
@@ -337,6 +369,76 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
     }
 
     // Default to false - only explicit matches are considered artifacts
+    false
+}
+
+/// Helper function to match multi-component patterns against path suffixes
+/// Supports wildcards like "*.xcworkspace/xcuserdata" and literals like "vendor/bundle"
+fn matches_path_suffix(path: &Path, pattern: &str) -> bool {
+    // Split the pattern into components
+    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+
+    // Get path components from the end
+    let path_components: Vec<_> = path
+        .components()
+        .filter_map(|c| {
+            if let std::path::Component::Normal(os_str) = c {
+                Some(os_str.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Check if we have enough components to match
+    if path_components.len() < pattern_parts.len() {
+        return false;
+    }
+
+    // Match from the end of the path
+    let start_idx = path_components.len() - pattern_parts.len();
+    for (i, pattern_part) in pattern_parts.iter().enumerate() {
+        let path_component = &path_components[start_idx + i];
+
+        if !matches_component(path_component, pattern_part) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Helper function to match a single path component against a pattern with wildcards
+fn matches_component(component: &str, pattern: &str) -> bool {
+    if pattern == component {
+        // Exact match
+        return true;
+    }
+
+    if !pattern.contains('*') && !pattern.contains('?') {
+        // No wildcards, already checked exact match above
+        return false;
+    }
+
+    // Handle wildcards
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        // Simple suffix match like "*.xcworkspace"
+        return component.ends_with(suffix);
+    }
+
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        // Simple prefix match like "cmake-build-*"
+        return component.starts_with(prefix);
+    }
+
+    // Complex glob pattern - split on * and match parts
+    let parts: Vec<&str> = pattern.split('*').collect();
+    if parts.len() == 2 {
+        return component.starts_with(parts[0]) && component.ends_with(parts[1]);
+    }
+
+    // For more complex patterns, we'd need a full glob matcher
+    // For now, return false for patterns we can't handle
     false
 }
 
@@ -458,11 +560,13 @@ fn has_tracked_files(dir: &Path, vcs_type: VcsType, vcs_root: &Path) -> bool {
         VcsType::Jujutsu => {
             // Use: jj file list --ignore-working-copy 'glob:"dir/**"' | head -1
             // Note: --ignore-working-copy is faster (skips snapshot)
+            // Use relative path from VCS root to avoid false positives from directories with same basename
             let dir_pattern = format!(
                 "glob:\"{}/**\"",
-                dir.file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
+                dir.strip_prefix(vcs_root)
+                    .ok()
+                    .and_then(|p| p.to_str())
+                    .unwrap_or("")
             );
 
             let output = Command::new("jj")
@@ -632,6 +736,356 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Result from scanning a single path
+struct ScanResult {
+    projects: HashMap<PathBuf, ProjectReport>,
+    total_bytes: u64,
+}
+
+/// Handle a directory artifact (Category 2 or Category 3)
+fn handle_directory_artifact(
+    path: &Path,
+    start_path: &Path,
+    project_root: &Path,
+    projects: &mut HashMap<PathBuf, ProjectReport>,
+    skip_paths: &mut HashSet<PathBuf>,
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+) -> Result<u64> {
+    let mut total_bytes = 0u64;
+
+    // Detect VCS type once for this directory
+    let (vcs_type, vcs_root) = detect_vcs(path);
+    let vcs_root = vcs_root.unwrap_or_else(|| start_path.to_path_buf());
+
+    // Category 2: Recreatable directories (spot-check)
+    if is_recreatable_dir(path) {
+        if verbose {
+            println!("DEBUG: Spot-checking Category 2 directory: {}", path.display());
+        }
+
+        // Spot-check: Does this directory contain ANY tracked files?
+        if has_tracked_files(path, vcs_type, &vcs_root) {
+            if verbose {
+                println!("  Contains tracked files, skipping");
+            }
+            skip_paths.insert(path.to_path_buf());
+            return Ok(0);
+        }
+
+        // No tracked files → entire directory can be removed
+        let dir_size = calculate_total_dir_size(path);
+        total_bytes += dir_size;
+
+        let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
+            ProjectReport {
+                artifacts: Vec::new(),
+            }
+        });
+
+        // Remove entire directory if in delete mode
+        if delete && !dry_run {
+            match fs::remove_dir_all(path) {
+                Ok(_) => {
+                    if verbose {
+                        println!("Removed directory: {}", path.display());
+                    }
+                }
+                Err(err) => {
+                    if verbose {
+                        eprintln!("Error removing {}: {}", path.display(), err);
+                    }
+                }
+            }
+        } else if dry_run && list {
+            println!("Would remove directory: {}", path.display());
+        }
+
+        project_report.artifacts.push(ArtifactEntry {
+            path: path.to_path_buf(),
+            size: dir_size,
+            removed: delete || dry_run,
+        });
+
+        skip_paths.insert(path.to_path_buf());
+        return Ok(total_bytes);
+    }
+
+    // Category 3: Other directories (batch-check contents)
+    if verbose {
+        println!("DEBUG: Batch-checking Category 3 directory: {}", path.display());
+    }
+
+    // Get all tracked files in this directory with a single VCS call
+    let tracked_files = get_tracked_files_batch(path, vcs_type, &vcs_root);
+
+    if verbose {
+        println!("  Found {} tracked files", tracked_files.len());
+    }
+
+    // Walk directory and collect untracked files for removal
+    let mut dir_total_size = 0u64;
+    let mut files_to_remove = Vec::new();
+
+    for entry in walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let file_path = entry.path();
+
+        // Check if file is tracked (O(1) lookup in HashSet)
+        if !tracked_files.contains(file_path) {
+            if let Ok(meta) = entry.metadata() {
+                let file_size = meta.len();
+                dir_total_size += file_size;
+                files_to_remove.push((file_path.to_path_buf(), file_size));
+            }
+        }
+    }
+
+    // Only report and remove if there are untracked files
+    if !files_to_remove.is_empty() {
+        total_bytes += dir_total_size;
+
+        let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
+            ProjectReport {
+                artifacts: Vec::new(),
+            }
+        });
+
+        // Remove files if in delete mode
+        if delete && !dry_run {
+            for (file_path, _) in &files_to_remove {
+                match fs::remove_file(file_path) {
+                    Ok(_) => {
+                        if verbose {
+                            println!("Removed: {}", file_path.display());
+                        }
+                    }
+                    Err(err) => {
+                        if verbose {
+                            eprintln!("Error removing {}: {}", file_path.display(), err);
+                        }
+                    }
+                }
+            }
+        } else if dry_run && list {
+            println!("Would remove: {} ({} untracked files)", path.display(), files_to_remove.len());
+        }
+
+        project_report.artifacts.push(ArtifactEntry {
+            path: path.to_path_buf(),
+            size: dir_total_size,
+            removed: delete || dry_run,
+        });
+    }
+
+    skip_paths.insert(path.to_path_buf());
+    Ok(total_bytes)
+}
+
+/// Handle a file artifact
+fn handle_file_artifact(
+    path: &Path,
+    metadata: &fs::Metadata,
+    project_root: &Path,
+    projects: &mut HashMap<PathBuf, ProjectReport>,
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+) -> Result<u64> {
+    // For files: check if tracked in version control
+    if is_tracked_in_vcs(path) {
+        if verbose {
+            println!("Skipping tracked file: {}", path.display());
+        }
+        return Ok(0);
+    }
+
+    let size = metadata.len();
+
+    let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
+        ProjectReport {
+            artifacts: Vec::new(),
+        }
+    });
+
+    let removed = if delete || dry_run {
+        if dry_run {
+            if list {
+                println!("Would remove: {}", path.display());
+            }
+            false // Not actually removed in dry run
+        } else {
+            // We only remove files now, directories are handled in cleanup pass
+            match fs::remove_file(path) {
+                Ok(_) => {
+                    if verbose {
+                        println!("Removed: {}", path.display());
+                    }
+                    true
+                }
+                Err(err) => {
+                    eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
+                    false
+                }
+            }
+        }
+    } else {
+        false // Not removed if neither delete nor dry_run
+    };
+
+    project_report.artifacts.push(ArtifactEntry {
+        path: path.to_path_buf(),
+        size,
+        removed,
+    });
+
+    Ok(size)
+}
+
+/// Scan a single path for artifacts (used for parallel processing)
+fn scan_single_path(
+    start_path_str: &str,
+    patterns: &[ArtifactPattern],
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+) -> Result<ScanResult> {
+    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
+    let mut skip_paths: HashSet<PathBuf> = HashSet::new();
+    let mut total_bytes: u64 = 0;
+    let mut _total_files: u64 = 0;
+
+    let start_path = PathBuf::from(start_path_str);
+    if verbose {
+        println!("DEBUG: Scanning directory {}", start_path.display());
+        println!("DEBUG: Directory contents:");
+        if let Ok(entries) = fs::read_dir(&start_path) {
+            for entry in entries.flatten() {
+                println!("  > {}", entry.path().display());
+            }
+        }
+    }
+
+    let walker = WalkBuilder::new(&start_path)
+        .hidden(false) // Include hidden files/dirs by default
+        .git_ignore(true)
+        .build();
+
+    for result in walker {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("Warning: Failed to access entry: {}", err);
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        // Never process the scan root itself as an artifact
+        if path == start_path.as_path() {
+            continue;
+        }
+
+        // Skip VCS directories (version control internals)
+        if path.components().any(|c| {
+            if let std::path::Component::Normal(name) = c {
+                VCS_INTERNALS.contains(&name.to_str().unwrap_or(""))
+            } else {
+                false
+            }
+        }) {
+            continue;
+        }
+
+        // Skip if this path is inside an artifact directory we've already processed
+        if skip_paths.iter().any(|skip| path.starts_with(skip)) {
+            continue;
+        }
+
+        // Try to find project root, but constrain it to be within the scan directory
+        let project_root = find_project_root(path)
+            .and_then(|root| {
+                if root.starts_with(&start_path) {
+                    Some(root)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| start_path.clone());
+
+        // Add debugging to see each path we check
+        if verbose {
+            println!("DEBUG: Checking path: {}", path.display());
+        }
+
+        // Check if the path is an artifact
+        if is_artifact(path, patterns) {
+            // Use symlink_metadata to avoid following symlinks
+            let metadata = match fs::symlink_metadata(path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    eprintln!(
+                        "Warning: Could not get metadata for {}: {}",
+                        path.display(),
+                        err
+                    );
+                    continue;
+                }
+            };
+
+            // Skip symlinks entirely
+            if metadata.is_symlink() {
+                if verbose {
+                    println!("Skipping symlink: {}", path.display());
+                }
+                continue;
+            }
+
+            // Handle directories or files
+            if metadata.is_dir() {
+                let bytes = handle_directory_artifact(
+                    path,
+                    &start_path,
+                    &project_root,
+                    &mut projects,
+                    &mut skip_paths,
+                    delete,
+                    verbose,
+                    dry_run,
+                    list,
+                )?;
+                total_bytes += bytes;
+            } else {
+                let bytes = handle_file_artifact(
+                    path,
+                    &metadata,
+                    &project_root,
+                    &mut projects,
+                    delete,
+                    verbose,
+                    dry_run,
+                    list,
+                )?;
+                total_bytes += bytes;
+                _total_files += 1;
+            }
+        }
+    }
+
+    Ok(ScanResult {
+        projects,
+        total_bytes,
+    })
+}
+
 fn scan_for_artifacts(
     paths: &[String],
     delete: bool,
@@ -641,304 +1095,53 @@ fn scan_for_artifacts(
     list: bool,
     aggressive: bool,
 ) -> Result<()> {
-    let mut total_bytes: u64 = 0;
-    let mut _total_files: u64 = 0;
-    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
-    let mut skip_paths: HashSet<PathBuf> = HashSet::new(); // Paths to skip (artifact dirs we've already processed)
-
-    // Load patterns once
+    // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
 
-    // Collect a set of artifact patterns that are just filenames (no paths/wildcards)
-    // for quick lookup during project language detection
-    let _language_files: HashSet<String> = patterns
-        .iter() // Iterate over &ArtifactPattern
-        .filter(|p| !p.pattern.contains('*') && !p.pattern.contains('/')) // Access pattern field directly
-        .map(|p| p.pattern.clone()) // Access pattern field directly
-        .collect();
-
-    for start_path_str in paths {
-        let start_path = PathBuf::from(start_path_str);
-        if verbose {
-            println!("DEBUG: Scanning directory {}", start_path.display());
-            println!("DEBUG: Directory contents:");
-            if let Ok(entries) = fs::read_dir(&start_path) {
-                for entry in entries.flatten() {
-                    println!("  > {}", entry.path().display());
-                }
+    // Canonicalize and deduplicate paths to prevent:
+    // 1. Double-counting artifact sizes
+    // 2. Race conditions during deletion
+    // 3. Redundant scanning of overlapping paths
+    let mut canonical_paths: HashSet<PathBuf> = HashSet::new();
+    for path_str in paths {
+        let path = PathBuf::from(path_str);
+        match path.canonicalize() {
+            Ok(canonical) => {
+                canonical_paths.insert(canonical);
+            }
+            Err(e) => {
+                eprintln!("Warning: Could not canonicalize path '{}': {}", path_str, e);
+                // Still add the original path if canonicalization fails
+                canonical_paths.insert(path);
             }
         }
+    }
 
-        let walker = WalkBuilder::new(&start_path)
-            .hidden(false) // Include hidden files/dirs by default
-            .git_ignore(true)
-            .build();
+    let unique_paths: Vec<String> = canonical_paths
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
 
-        for result in walker {
-            let entry = match result {
-                Ok(entry) => entry,
-                Err(err) => {
-                    eprintln!("Warning: Failed to access entry: {}", err);
-                    continue;
-                }
-            };
+    // Scan paths in parallel
+    let results: Vec<ScanResult> = unique_paths
+        .par_iter()
+        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list))
+        .collect::<Result<Vec<_>>>()?;
 
-            let path = entry.path();
+    // Merge results from parallel scans
+    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
+    let mut total_bytes: u64 = 0;
 
-            // Never process the scan root itself as an artifact
-            if path == start_path.as_path() {
-                continue;
-            }
-
-            // Skip VCS directories (version control internals)
-            // This matches the common VCS directories that tools like Mutagen and Syncthing skip
-            if path.components().any(|c| {
-                if let std::path::Component::Normal(name) = c {
-                    VCS_INTERNALS.contains(&name.to_str().unwrap_or(""))
-                } else {
-                    false
-                }
-            }) {
-                continue;
-            }
-
-            // Skip if this path is inside an artifact directory we've already processed
-            if skip_paths.iter().any(|skip| path.starts_with(skip)) {
-                continue;
-            }
-
-            // Try to find project root, but constrain it to be within the scan directory
-            let project_root = find_project_root(path)
-                .and_then(|root| {
-                    // Only use the found root if it's within the scan directory
-                    if root.starts_with(&start_path) {
-                        Some(root)
-                    } else {
-                        None
-                    }
+    for result in results {
+        total_bytes += result.total_bytes;
+        for (project_path, project_report) in result.projects {
+            projects
+                .entry(project_path)
+                .or_insert_with(|| ProjectReport {
+                    artifacts: Vec::new(),
                 })
-                .unwrap_or_else(|| start_path.clone());
-
-            // Add debugging to see each path we check
-            if verbose {
-                println!("DEBUG: Checking path: {}", path.display());
-            }
-
-            // Check if the path is an artifact
-            // Pass patterns as a slice
-            if is_artifact(path, &patterns) {
-                // Use symlink_metadata to avoid following symlinks
-                let metadata = match fs::symlink_metadata(path) {
-                    Ok(meta) => meta,
-                    Err(err) => {
-                        eprintln!(
-                            "Warning: Could not get metadata for {}: {}",
-                            path.display(),
-                            err
-                        );
-                        continue;
-                    }
-                };
-
-                // Skip symlinks entirely - don't delete them or their targets
-                if metadata.is_symlink() {
-                    if verbose {
-                        println!("Skipping symlink: {}", path.display());
-                    }
-                    continue;
-                }
-
-                // Handle directories - use 3-tier categorization for performance
-                // See docs/architecture.md for detailed explanation
-                if metadata.is_dir() {
-                    let dir_name = path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("");
-
-                    // Detect VCS type once for this directory
-                    let (vcs_type, vcs_root) = detect_vcs(path);
-                    let vcs_root = vcs_root.unwrap_or_else(|| start_path.clone());
-
-                    // Category 2: Recreatable directories (spot-check)
-                    // These directories are conventionally untracked and can be recreated from manifests
-                    if RECREATABLE_DIRS.contains(&dir_name) {
-                        if verbose {
-                            println!("DEBUG: Spot-checking Category 2 directory: {}", path.display());
-                        }
-
-                        // Spot-check: Does this directory contain ANY tracked files?
-                        if has_tracked_files(path, vcs_type, &vcs_root) {
-                            if verbose {
-                                println!("  Contains tracked files, skipping");
-                            }
-                            skip_paths.insert(path.to_path_buf());
-                            continue;
-                        }
-
-                        // No tracked files → entire directory can be removed
-                        let dir_size = calculate_total_dir_size(path);
-                        total_bytes += dir_size;
-
-                        let project_report = projects.entry(project_root.clone()).or_insert_with(|| {
-                            ProjectReport {
-                                artifacts: Vec::new(),
-                            }
-                        });
-
-                        // Remove entire directory if in delete mode
-                        if delete && !dry_run {
-                            match fs::remove_dir_all(path) {
-                                Ok(_) => {
-                                    if verbose {
-                                        println!("Removed directory: {}", path.display());
-                                    }
-                                }
-                                Err(err) => {
-                                    if verbose {
-                                        eprintln!("Error removing {}: {}", path.display(), err);
-                                    }
-                                }
-                            }
-                        } else if dry_run && list {
-                            println!("Would remove directory: {}", path.display());
-                        }
-
-                        project_report.artifacts.push(ArtifactEntry {
-                            path: path.to_path_buf(),
-                            size: dir_size,
-                            removed: delete || dry_run,
-                        });
-
-                        skip_paths.insert(path.to_path_buf());
-                        continue;
-                    }
-
-                    // Category 3: Other directories (batch-check contents)
-                    // For mixed directories, we need file-level granularity
-                    if verbose {
-                        println!("DEBUG: Batch-checking Category 3 directory: {}", path.display());
-                    }
-
-                    // Get all tracked files in this directory with a single VCS call
-                    let tracked_files = get_tracked_files_batch(path, vcs_type, &vcs_root);
-
-                    if verbose {
-                        println!("  Found {} tracked files", tracked_files.len());
-                    }
-
-                    // Walk directory and collect untracked files for removal
-                    let mut dir_total_size = 0u64;
-                    let mut files_to_remove = Vec::new();
-
-                    for entry in walkdir::WalkDir::new(path)
-                        .into_iter()
-                        .filter_map(|e| e.ok())
-                        .filter(|e| e.file_type().is_file())
-                    {
-                        let file_path = entry.path();
-
-                        // Check if file is tracked (O(1) lookup in HashSet)
-                        if !tracked_files.contains(file_path) {
-                            if let Ok(meta) = entry.metadata() {
-                                let file_size = meta.len();
-                                dir_total_size += file_size;
-                                files_to_remove.push((file_path.to_path_buf(), file_size));
-                            }
-                        }
-                    }
-
-                    // Only report and remove if there are untracked files
-                    if !files_to_remove.is_empty() {
-                        total_bytes += dir_total_size;
-
-                        let project_report = projects.entry(project_root.clone()).or_insert_with(|| {
-                            ProjectReport {
-                                artifacts: Vec::new(),
-                            }
-                        });
-
-                        // Remove files if in delete mode
-                        if delete && !dry_run {
-                            for (file_path, _) in &files_to_remove {
-                                match fs::remove_file(file_path) {
-                                    Ok(_) => {
-                                        if verbose {
-                                            println!("Removed: {}", file_path.display());
-                                        }
-                                    }
-                                    Err(err) => {
-                                        if verbose {
-                                            eprintln!("Error removing {}: {}", file_path.display(), err);
-                                        }
-                                    }
-                                }
-                            }
-                        } else if dry_run && list {
-                            println!("Would remove: {} ({} untracked files)", path.display(), files_to_remove.len());
-                        }
-
-                        project_report.artifacts.push(ArtifactEntry {
-                            path: path.to_path_buf(),
-                            size: dir_total_size,
-                            removed: delete || dry_run,
-                        });
-                    }
-
-                    skip_paths.insert(path.to_path_buf());
-                    continue;
-                }
-
-                // For files: check if tracked in version control
-                if is_tracked_in_vcs(path) {
-                    if verbose {
-                        println!("Skipping tracked file: {}", path.display());
-                    }
-                    continue;
-                }
-
-                // We've already filtered out directories, so this is always a file
-                let size = metadata.len();
-
-                total_bytes += size;
-                _total_files += 1;
-
-                let project_report = projects.entry(project_root.clone()).or_insert_with(|| {
-                    ProjectReport {
-                        artifacts: Vec::new(),
-                    }
-                });
-
-                let removed = if delete || dry_run {
-                    if dry_run {
-                        if list {
-                            println!("Would remove: {}", path.display());
-                        }
-                        false // Not actually removed in dry run
-                    } else {
-                        // We only remove files now, directories are handled in cleanup pass
-                        match fs::remove_file(path) {
-                            Ok(_) => {
-                                if verbose {
-                                    println!("Removed: {}", path.display());
-                                }
-                                true
-                            }
-                            Err(err) => {
-                                eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
-                                false
-                            }
-                        }
-                    }
-                } else {
-                    false // Not removed if neither delete nor dry_run
-                };
-
-                project_report.artifacts.push(ArtifactEntry {
-                    path: path.to_path_buf(),
-                    size,
-                    removed,
-                });
-            }
+                .artifacts
+                .extend(project_report.artifacts);
         }
     }
 

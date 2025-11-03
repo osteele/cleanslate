@@ -6,6 +6,9 @@ use tempfile::tempdir;
 fn setup_test_directory() -> tempfile::TempDir {
     let dir = tempdir().unwrap();
 
+    // Create a Cargo.toml to make this a valid project root (needed for /target pattern)
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+
     // Create a mock directory structure for testing
     fs::create_dir_all(dir.path().join("node_modules")).unwrap();
     fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
@@ -62,9 +65,7 @@ fn test_delete_flag_dry_run() {
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
     let assert = cmd.arg(dir.path()).assert();
 
-    assert
-        .success()
-        .stdout(predicate::str::contains("Total")); // Table format shows "Total" row
+    assert.success().stdout(predicate::str::contains("Total")); // Table format shows "Total" row
 
     // Verify that our artifacts still exist
     assert!(dir.path().join("node_modules").exists());

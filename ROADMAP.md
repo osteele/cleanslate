@@ -55,16 +55,47 @@ cleanslate clean-caches     # Clean only cache directories (preserve build outpu
 
 ## Performance Improvements
 
+### Completed ✅
+- **Parallel directory scanning**: ✅ Implemented inter-project parallelism with rayon
+- **Batch VCS checks**: ✅ Implemented spot-check and batch-check optimizations
+- **Three-tier directory categorization**: ✅ VCS internals, recreatable dirs, other dirs
+
 ### Current Performance Characteristics
-- Single-threaded directory traversal
-- Synchronous VCS checks (git/jj commands)
+- Parallel project scanning (rayon work-stealing thread pool)
+- Optimized VCS checks (O(D) instead of O(N) where D=directories, N=files)
+- Results collected and displayed after all scanning completes
 
 ### Planned Optimizations
-- **Parallel directory scanning**: Use rayon for concurrent traversal
-- **Batch VCS checks**: Check multiple files in one git/jj command
+
+#### Progressive Display (Skeleton Fill-In)
+**Goal**: Show immediate visual feedback while maintaining alphabetical order
+
+**Implementation approach**:
+1. Pre-print alphabetical table with all project paths and "..." placeholders
+2. As results complete in parallel, update corresponding lines using ANSI cursor positioning
+3. Users see instant feedback with projects filling in as they complete
+4. Fallback to current behavior for non-TTY output (pipes/redirects)
+
+**Benefits**:
+- Immediate feedback (< 0.1s to see all projects listed)
+- Alphabetical order maintained throughout
+- Visual progress indication (watch "..." become data)
+- Full parallelism retained (no blocking)
+- Professional appearance
+
+**Technical details**:
+- Add `atty` dependency to detect terminal vs pipe
+- Use ANSI escape codes (`\x1b[H`, `\x1b[K`) for cursor positioning
+- Track line numbers for each project path
+- Update lines from parallel threads with mutex-protected stdout
+- Estimated ~80 new lines, ~30 modified lines
+
+**Status**: Designed, ready for implementation
+
+#### Other Planned Optimizations
 - **Smart caching**: Cache project root detection results
-- **Early termination**: Skip scanning inside large artifact directories
-- **Progress indicators**: Show progress for long-running scans
+- **Early termination**: Skip scanning inside large artifact directories (already partially implemented)
+- **Progress indicators**: Add progress percentage and estimated time remaining to progressive display
 
 ## User Experience
 

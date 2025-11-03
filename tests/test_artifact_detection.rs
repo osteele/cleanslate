@@ -7,7 +7,7 @@ mod main;
 #[test]
 fn test_is_artifact() {
     // Load patterns once and unwrap/expect
-    let patterns = get_artifact_patterns().expect("Failed to load artifact patterns for test");
+    let patterns = get_artifact_patterns(true).expect("Failed to load artifact patterns for test");
 
     // Python artifacts
     assert!(
@@ -119,7 +119,7 @@ fn test_pattern_prefix_behavior() {
     // This test verifies that patterns with / prefix only match at project root
     // while patterns without / match anywhere in the path
 
-    let patterns = get_artifact_patterns().expect("Failed to load artifact patterns for test");
+    let patterns = get_artifact_patterns(true).expect("Failed to load artifact patterns for test");
 
     // Patterns WITH / prefix should only match at project root
     // We can't fully test this without a real project structure, but we can verify
