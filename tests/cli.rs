@@ -64,7 +64,7 @@ fn test_delete_flag_dry_run() {
 
     assert
         .success()
-        .stdout(predicate::str::contains("Total Size Found"));
+        .stdout(predicate::str::contains("Total")); // Table format shows "Total" row
 
     // Verify that our artifacts still exist
     assert!(dir.path().join("node_modules").exists());

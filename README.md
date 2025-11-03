@@ -89,14 +89,20 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Scan current directory
+# Scan current directory (shows table by default)
 cleanslate
 
 # Scan specific directories
 cleanslate /path/to/dir1 /path/to/dir2
 
-# Show verbose output
-cleanslate -v
+# Preview what would be deleted (dry run)
+cleanslate --dry-run
+
+# Show detailed list format instead of table
+cleanslate --list
+
+# Show verbose output with individual files
+cleanslate -v --files
 
 # Delete artifacts
 cleanslate --delete
@@ -107,8 +113,22 @@ cleanslate --delete
 - `[PATHS]...`: Directories to scan (defaults to current directory)
 - `-d, --delete`: Delete the found artifacts
 - `-v, --verbose`: Show detailed information about found artifacts
+- `-f, --files`: Show individual files instead of summary per directory
+- `--dry-run`: Show what would be deleted without actually deleting (implies --delete)
+- `-l, --list`: Show detailed list format instead of table (table is default)
 - `-h, --help`: Print help
 - `-V, --version`: Print version
+
+## Output Format
+
+By default, cleanslate displays results in a clean table format:
+
+- **Path**: Relative path from scan directory
+- **Removable**: Size of artifacts that would be removed (highlighted in bold red if >100 MiB)
+- **Total**: Total project size including all files
+- **What**: List of artifacts to be removed (large items >50 MiB shown in bold, truncated with `...` to fit terminal width)
+
+Large projects (>500 MiB total) are highlighted in bold yellow.
 
 ## License
 

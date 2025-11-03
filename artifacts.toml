@@ -25,8 +25,6 @@ patterns = [
 
 [general.temp]
 patterns = [
-  ".DS_Store",
-  "Thumbs.db",
   "/tmp",
   "tmp",
   "/temp",
@@ -38,6 +36,13 @@ patterns = [
   "*.swp",
   "*~"
 ]
+
+[general.temp_small]
+patterns = [
+  ".DS_Store",
+  "Thumbs.db"
+]
+aggressive = true
 
 [general.logs]
 patterns = [

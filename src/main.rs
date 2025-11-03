@@ -37,6 +37,14 @@ struct Args {
     /// Show what would be deleted without actually deleting (implies --delete)
     #[arg(long)]
     dry_run: bool,
+
+    /// Show detailed list format instead of table (table is default)
+    #[arg(long, short)]
+    list: bool,
+
+    /// Aggressive mode: also remove small/trivial files like .DS_Store
+    #[arg(long)]
+    aggressive: bool,
 }
 
 struct ArtifactEntry {
@@ -66,12 +74,15 @@ pub enum ArtifactType {
 #[derive(Debug, Clone)]
 pub struct ArtifactPattern {
     pattern: String,
+    #[allow(dead_code)]
     artifact_type: ArtifactType,
     /// Is this a standalone pattern or should it be properly contextualized?
     /// For example, "dist" should only match at the project root level, not any directory named "dist"
     needs_context: bool,
     /// The name of the language this pattern belongs to (e.g., "Python", "JavaScript")
     language_name: String,
+    /// Whether this pattern should only be used in aggressive mode
+    aggressive: bool,
 }
 
 /// Structure to deserialize artifact patterns from TOML
@@ -91,6 +102,8 @@ struct LanguageConfig {
 #[derive(Debug, Deserialize)]
 struct PatternConfig {
     patterns: Vec<String>,
+    #[serde(default)]
+    aggressive: bool,
 }
 
 // Embed the TOML file directly in the binary at compile time
@@ -109,21 +122,27 @@ fn get_artifact_patterns_from_toml() -> Result<Vec<ArtifactPattern>> {
         // Process each artifact type (cache, build, etc.)
         for (type_key, pattern_config) in lang_config.types {
             // Determine the artifact type based on the TOML key
-            let artifact_type = match type_key.as_str() {
-                "cache" => ArtifactType::Cache,
-                "dependencies" => ArtifactType::Dependency,
-                "build" => ArtifactType::Build,
-                "temp" => ArtifactType::Temp,
-                "logs" => ArtifactType::Logs,
-                "intermediate" => ArtifactType::Intermediate,
-                "ide" => ArtifactType::IDE,
-                _ => {
-                    eprintln!(
-                        "Warning: Unknown artifact type '{}', defaulting to Cache",
-                        type_key
-                    );
-                    ArtifactType::Cache
-                }
+            // Support variants like "temp_small" by matching prefix
+            let artifact_type = if type_key.starts_with("cache") {
+                ArtifactType::Cache
+            } else if type_key.starts_with("dependencies") {
+                ArtifactType::Dependency
+            } else if type_key.starts_with("build") {
+                ArtifactType::Build
+            } else if type_key.starts_with("temp") {
+                ArtifactType::Temp
+            } else if type_key.starts_with("logs") {
+                ArtifactType::Logs
+            } else if type_key.starts_with("intermediate") {
+                ArtifactType::Intermediate
+            } else if type_key.starts_with("ide") {
+                ArtifactType::IDE
+            } else {
+                eprintln!(
+                    "Warning: Unknown artifact type '{}', defaulting to Cache",
+                    type_key
+                );
+                ArtifactType::Cache
             };
 
             // Process each pattern
@@ -143,6 +162,7 @@ fn get_artifact_patterns_from_toml() -> Result<Vec<ArtifactPattern>> {
                     artifact_type,
                     needs_context,
                     language_name: lang_config.name.clone(),
+                    aggressive: pattern_config.aggressive,
                 });
             }
         }
@@ -156,9 +176,18 @@ pub fn load_artifact_patterns() -> Result<Vec<ArtifactPattern>> {
     get_artifact_patterns_from_toml()
 }
 
-/// Alias for backward compatibility
-pub fn get_artifact_patterns() -> Result<Vec<ArtifactPattern>> {
-    load_artifact_patterns()
+/// Get artifact patterns, optionally filtering by aggressive mode
+pub fn get_artifact_patterns(aggressive: bool) -> Result<Vec<ArtifactPattern>> {
+    let all_patterns = load_artifact_patterns()?;
+
+    // Filter out aggressive-only patterns if not in aggressive mode
+    let patterns = if aggressive {
+        all_patterns
+    } else {
+        all_patterns.into_iter().filter(|p| !p.aggressive).collect()
+    };
+
+    Ok(patterns)
 }
 
 /// Check if a path is an artifact based on the patterns
@@ -243,90 +272,6 @@ fn is_project_root(path: &Path) -> bool {
     false
 }
 
-fn calculate_dir_size(path: &Path) -> Result<u64> {
-    let mut total = 0;
-
-    // First check if path exists
-    if !path.exists() {
-        return Ok(0);
-    }
-
-    // Use symlink_metadata to avoid following symlinks
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) => {
-            eprintln!(
-                "Warning: Could not get metadata for {}: {}",
-                path.display(),
-                err
-            );
-            return Ok(0);
-        }
-    };
-
-    // Skip symlinks entirely - don't follow them or count their size
-    if metadata.is_symlink() {
-        return Ok(0);
-    }
-
-    if metadata.is_file() {
-        return Ok(metadata.len());
-    }
-
-    let read_dir_result = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) => {
-            eprintln!(
-                "Warning: Failed to read directory {}: {}",
-                path.display(),
-                err
-            );
-            return Ok(0);
-        }
-    };
-
-    for entry_result in read_dir_result {
-        let entry = match entry_result {
-            Ok(entry) => entry,
-            Err(err) => {
-                eprintln!(
-                    "Warning: Error reading entry in {}: {}",
-                    path.display(),
-                    err
-                );
-                continue;
-            }
-        };
-
-        let entry_path = entry.path();
-
-        // Use symlink_metadata to check if this entry is a symlink
-        let entry_metadata = match fs::symlink_metadata(&entry_path) {
-            Ok(meta) => meta,
-            Err(err) => {
-                eprintln!(
-                    "Warning: Could not get metadata for {}: {}",
-                    entry_path.display(),
-                    err
-                );
-                continue;
-            }
-        };
-
-        // Skip symlinks - don't recurse into them or count their size
-        if entry_metadata.is_symlink() {
-            continue;
-        }
-
-        if entry_metadata.is_dir() {
-            total += calculate_dir_size(&entry_path).unwrap_or(0);
-        } else {
-            total += entry_metadata.len();
-        }
-    }
-
-    Ok(total)
-}
 
 /// Check if a path is tracked in git by running git ls-files
 /// Returns true if the file is tracked in version control
@@ -402,6 +347,38 @@ fn is_tracked_in_vcs(path: &Path) -> bool {
     false
 }
 
+/// Calculate total size of a directory (all files, not just artifacts)
+fn calculate_total_dir_size(path: &Path) -> u64 {
+    use std::fs;
+
+    let mut total = 0u64;
+
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+
+            if let Ok(metadata) = entry.metadata() {
+                if metadata.is_file() {
+                    total += metadata.len();
+                } else if metadata.is_dir() {
+                    // Skip VCS directories
+                    if let Some(name) = entry_path.file_name() {
+                        if matches!(
+                            name.to_str().unwrap_or(""),
+                            ".git" | ".jj" | ".svn" | ".hg" | ".bzr" | "_darcs" | ".pijul" | "CVS" | ".fossil"
+                        ) {
+                            continue;
+                        }
+                    }
+                    total += calculate_total_dir_size(&entry_path);
+                }
+            }
+        }
+    }
+
+    total
+}
+
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     let indicators = [
         "Cargo.toml",     // Rust
@@ -443,15 +420,16 @@ fn scan_for_artifacts(
     verbose: bool,
     files: bool,
     dry_run: bool,
+    list: bool,
+    aggressive: bool,
 ) -> Result<()> {
     let mut total_bytes: u64 = 0;
     let mut _total_files: u64 = 0;
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
-    let mut language_counts: HashMap<ArtifactType, HashMap<PathBuf, String>> = HashMap::new();
     let mut skip_paths: HashSet<PathBuf> = HashSet::new(); // Paths to skip (artifact dirs we've already processed)
 
     // Load patterns once
-    let patterns = get_artifact_patterns().context("Failed to load artifact patterns")?;
+    let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
 
     // Collect a set of artifact patterns that are just filenames (no paths/wildcards)
     // for quick lookup during project language detection
@@ -514,8 +492,17 @@ fn scan_for_artifacts(
                 continue;
             }
 
-            // Try to find project root, default to start_path if not found
-            let project_root = find_project_root(path).unwrap_or_else(|| start_path.clone());
+            // Try to find project root, but constrain it to be within the scan directory
+            let project_root = find_project_root(path)
+                .and_then(|root| {
+                    // Only use the found root if it's within the scan directory
+                    if root.starts_with(&start_path) {
+                        Some(root)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| start_path.clone());
 
             // Add debugging to see each path we check
             if verbose {
@@ -525,14 +512,6 @@ fn scan_for_artifacts(
             // Check if the path is an artifact
             // Pass patterns as a slice
             if is_artifact(path, &patterns) {
-                // Skip files that are tracked in version control
-                if is_tracked_in_vcs(path) {
-                    if verbose {
-                        println!("Skipping tracked file: {}", path.display());
-                    }
-                    continue;
-                }
-
                 // Use symlink_metadata to avoid following symlinks
                 let metadata = match fs::symlink_metadata(path) {
                     Ok(meta) => meta,
@@ -554,24 +533,82 @@ fn scan_for_artifacts(
                     continue;
                 }
 
-                // If this is a directory artifact, add it to skip_paths so we don't process its contents
+                // Handle directories - walk them to find removable files
                 if metadata.is_dir() {
+                    // Walk the directory and collect untracked files to remove
+                    let mut dir_total_size = 0u64;
+                    let mut files_to_remove = Vec::new();
+
+                    for entry in walkdir::WalkDir::new(path)
+                        .into_iter()
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.file_type().is_file())
+                    {
+                        let file_path = entry.path();
+
+                        // Check if this file is tracked
+                        if !is_tracked_in_vcs(file_path) {
+                            if let Ok(meta) = entry.metadata() {
+                                let file_size = meta.len();
+                                dir_total_size += file_size;
+                                files_to_remove.push((file_path.to_path_buf(), file_size));
+                            }
+                        }
+                    }
+
+                    // Only report and remove if there are actually untracked files
+                    if !files_to_remove.is_empty() {
+                        total_bytes += dir_total_size;
+
+                        let project_report = projects.entry(project_root.clone()).or_insert_with(|| {
+                            ProjectReport {
+                                artifacts: Vec::new(),
+                            }
+                        });
+
+                        // Remove files if in delete mode (not dry run)
+                        if delete && !dry_run {
+                            for (file_path, _) in &files_to_remove {
+                                match fs::remove_file(file_path) {
+                                    Ok(_) => {
+                                        if verbose {
+                                            println!("Removed: {}", file_path.display());
+                                        }
+                                    }
+                                    Err(err) => {
+                                        if verbose {
+                                            eprintln!("Error removing {}: {}", file_path.display(), err);
+                                        }
+                                    }
+                                }
+                            }
+                        } else if dry_run && list {
+                            println!("Would remove: {} ({} untracked files)", path.display(), files_to_remove.len());
+                        }
+
+                        // Add directory to report
+                        project_report.artifacts.push(ArtifactEntry {
+                            path: path.to_path_buf(),
+                            size: dir_total_size,
+                            removed: delete || dry_run,
+                        });
+                    }
+
+                    // Add to skip_paths so walker doesn't descend into it again
                     skip_paths.insert(path.to_path_buf());
+                    continue;
                 }
 
-                let size = if metadata.is_file() {
-                    metadata.len()
-                } else {
-                    // For directories, calculate size recursively but handle errors
-                    calculate_dir_size(path).unwrap_or_else(|err| {
-                        eprintln!(
-                            "Warning: Could not calculate size for directory {}: {}",
-                            path.display(),
-                            err
-                        );
-                        0
-                    })
-                };
+                // For files: check if tracked in version control
+                if is_tracked_in_vcs(path) {
+                    if verbose {
+                        println!("Skipping tracked file: {}", path.display());
+                    }
+                    continue;
+                }
+
+                // We've already filtered out directories, so this is always a file
+                let size = metadata.len();
 
                 total_bytes += size;
                 _total_files += 1;
@@ -584,15 +621,13 @@ fn scan_for_artifacts(
 
                 let removed = if delete || dry_run {
                     if dry_run {
-                        println!("Would remove: {}", path.display());
+                        if list {
+                            println!("Would remove: {}", path.display());
+                        }
                         false // Not actually removed in dry run
                     } else {
-                        let removal_result = if metadata.is_dir() {
-                            fs::remove_dir_all(path)
-                        } else {
-                            fs::remove_file(path)
-                        };
-                        match removal_result {
+                        // We only remove files now, directories are handled in cleanup pass
+                        match fs::remove_file(path) {
                             Ok(_) => {
                                 if verbose {
                                     println!("Removed: {}", path.display());
@@ -618,128 +653,345 @@ fn scan_for_artifacts(
         }
     }
 
-    // Function to detect languages based on common files
-    fn detect_project_languages(project_path: &Path, patterns: &[ArtifactPattern]) -> Vec<String> {
-        let mut detected_languages = HashSet::new();
-        let read_dir_result = match fs::read_dir(project_path) {
-            Ok(entries) => entries,
-            Err(err) => {
-                eprintln!(
-                    "Warning: Failed to read directory {}: {}",
-                    project_path.display(),
-                    err
-                );
-                return Vec::new(); // Return empty if we can't read the directory
-            }
-        };
+    // Cleanup pass: Remove empty directories
+    if delete && !dry_run {
+        // Collect all directories to check - both artifact dirs and parent dirs of removed files
+        let mut dirs_to_check: HashSet<PathBuf> = HashSet::new();
 
-        for entry in read_dir_result.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
-                    let path_str = path.to_string_lossy();
-                    // Find the pattern that matches this file
-                    // Iterate over &ArtifactPattern
-                    if let Some(matching_pattern) = patterns
-                        .iter()
-                        .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-                    {
-                        // Check if the artifact type suggests a language
-                        let artifact_type: Option<ArtifactType> = patterns
-                            .iter()
-                            .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-                            .map(|p| p.artifact_type); // Access artifact_type field directly
-                        if let Some(atype) = artifact_type {
-                            if !matches!(
-                                atype,
-                                ArtifactType::Temp | ArtifactType::Logs | ArtifactType::IDE
-                            ) {
-                                detected_languages.insert(matching_pattern.language_name.clone());
+        for project_report in projects.values() {
+            for entry in &project_report.artifacts {
+                if entry.removed {
+                    // If it's a directory artifact, add it
+                    if entry.path.is_dir() || entry.path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                        dirs_to_check.insert(entry.path.clone());
+                        // Also add all parent directories up to the project root
+                        let mut current = entry.path.as_path();
+                        while let Some(parent) = current.parent() {
+                            if dirs_to_check.insert(parent.to_path_buf()) {
+                                current = parent;
+                            } else {
+                                break; // Already added, no need to go further
+                            }
+                        }
+                    } else {
+                        // For files, add parent directories
+                        if let Some(parent) = entry.path.parent() {
+                            dirs_to_check.insert(parent.to_path_buf());
+                            // Also add ancestor directories
+                            let mut current = parent;
+                            while let Some(parent) = current.parent() {
+                                if dirs_to_check.insert(parent.to_path_buf()) {
+                                    current = parent;
+                                } else {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        // Convert HashSet to Vec for the return type
-        detected_languages.into_iter().collect()
+
+        // Sort directories by depth (deepest first) so we remove child dirs before parents
+        let mut dirs_vec: Vec<PathBuf> = dirs_to_check.into_iter().collect();
+        dirs_vec.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+
+        // Try to remove empty directories
+        for dir in dirs_vec {
+            // Skip if doesn't exist
+            if !dir.exists() {
+                continue;
+            }
+
+            // Check if directory is empty
+            match fs::read_dir(&dir) {
+                Ok(mut entries) => {
+                    if entries.next().is_none() {
+                        // Directory is empty, try to remove it
+                        match fs::remove_dir(&dir) {
+                            Ok(_) => {
+                                if verbose {
+                                    println!("Removed empty directory: {}", dir.display());
+                                }
+                            }
+                            Err(err) => {
+                                if verbose {
+                                    eprintln!("Warning: Failed to remove directory {}: {}", dir.display(), err);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Directory doesn't exist or can't be read, skip
+                    continue;
+                }
+            }
+        }
     }
+
 
     if projects.is_empty() {
         println!("No artifacts found.");
-    } else {
-        for (project_dir, report) in &projects {
-            let project_name = project_dir
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let project_path_display = project_dir.display();
-            let total_project_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
+    } else if !list {
+        // Table format (default): alphabetized, relative paths, omit empty projects
+        use terminal_size::{Width, terminal_size};
 
-            // Detect languages for this project
-            let languages = detect_project_languages(project_dir, &patterns); // Pass patterns slice
-            let language_str = if languages.is_empty() {
-                String::new()
+        let start_path = PathBuf::from(&paths[0]);
+
+        // Collect and sort projects by path, filtering out empty projects
+        let mut sorted_projects: Vec<_> = projects
+            .iter()
+            .filter(|(_, report)| {
+                let total: u64 = report.artifacts.iter().map(|a| a.size).sum();
+                total > 0
+            })
+            .collect();
+        sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
+
+        // Get terminal width (default to 120 if not available)
+        let terminal_width = if let Some((Width(w), _)) = terminal_size() {
+            w as usize
+        } else {
+            120
+        };
+
+        // Calculate max path width for alignment
+        let max_path_width = sorted_projects
+            .iter()
+            .map(|(path, _)| {
+                path.strip_prefix(&start_path)
+                    .unwrap_or(path)
+                    .display()
+                    .to_string()
+                    .len()
+            })
+            .max()
+            .unwrap_or(20)
+            .min(40); // Cap path width at 40 chars
+
+        // Fixed widths for size columns
+        let removable_width = 12;
+        let total_width = 12;
+
+        // Calculate What column width
+        let separator_width = 6; // spaces between columns
+        let what_width = terminal_width
+            .saturating_sub(max_path_width)
+            .saturating_sub(removable_width)
+            .saturating_sub(total_width)
+            .saturating_sub(separator_width)
+            .max(20);
+
+        // Print header
+        println!(
+            "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+            "Path", "Removable", "Total", "What",
+            path_w = max_path_width,
+            rem_w = removable_width,
+            tot_w = total_width
+        );
+        println!("{}", "─".repeat(terminal_width.min(120)));
+
+        let mut total_removable: u64 = 0;
+        let mut total_size: u64 = 0;
+
+        // Print each project
+        for (project_dir, report) in sorted_projects {
+            let removable_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
+
+            // Skip displaying the root directory line (but include in totals)
+            let is_root = project_dir == &start_path;
+
+            // Calculate full size (skip for root to avoid long scan)
+            let full_size = if is_root {
+                0 // We'll calculate total at the end
             } else {
-                format!(" ({})", languages.join(", "))
+                calculate_total_dir_size(project_dir)
+            };
+
+            total_removable += removable_size;
+            total_size += full_size;
+
+            // Skip displaying root directory
+            if is_root {
+                continue;
+            }
+
+            let relative_path = project_dir
+                .strip_prefix(&start_path)
+                .unwrap_or(project_dir)
+                .display()
+                .to_string();
+            let path_display = if relative_path.is_empty() {
+                ".".to_string()
+            } else {
+                relative_path
+            };
+
+            // Collect artifact names sorted by size (largest first)
+            let mut artifacts_with_size: Vec<(String, u64)> = report
+                .artifacts
+                .iter()
+                .map(|a| {
+                    let name = a.path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    (name, a.size)
+                })
+                .collect();
+            artifacts_with_size.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by size desc
+
+            // Build What column string with truncation
+            let mut what_parts = Vec::new();
+            let mut current_len = 0;
+            let large_threshold = 50 * 1024 * 1024; // 50 MiB
+
+            for (name, size) in &artifacts_with_size {
+                let formatted = if *size > large_threshold {
+                    format!("{}", name).bold().to_string()
+                } else {
+                    name.clone()
+                };
+
+                let add_len = if what_parts.is_empty() {
+                    formatted.len()
+                } else {
+                    formatted.len() + 2 // ", " separator
+                };
+
+                if current_len + add_len + 3 > what_width { // +3 for "..."
+                    what_parts.push("...".to_string());
+                    break;
+                }
+
+                what_parts.push(formatted);
+                current_len += add_len;
+            }
+
+            let what_display = what_parts.join(", ");
+
+            // Apply styling based on thresholds
+            let removable_display = if removable_size > 100 * 1024 * 1024 {
+                format_size(removable_size, BINARY).bold().red()
+            } else {
+                format_size(removable_size, BINARY).normal()
+            };
+
+            let path_styled = if full_size > 500 * 1024 * 1024 {
+                path_display.bold().yellow()
+            } else {
+                path_display.normal()
             };
 
             println!(
-                "{}",
-                format!(
-                    "Project: {} ({}){}",
-                    project_name, project_path_display, language_str
-                )
-                .bold()
+                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+                path_styled,
+                removable_display,
+                format_size(full_size, BINARY),
+                what_display,
+                path_w = max_path_width,
+                rem_w = removable_width,
+                tot_w = total_width
             );
+        }
+
+        println!("{}", "─".repeat(terminal_width.min(120)));
+        println!(
+            "{:<path_w$}  {:>rem_w$}  {:>tot_w$}",
+            "Total",
+            format_size(total_removable, BINARY),
+            format_size(total_size, BINARY),
+            path_w = max_path_width,
+            rem_w = removable_width,
+            tot_w = total_width
+        );
+        println!("\nRun with --list to see detailed breakdown by project");
+    } else {
+        // List format: alphabetized, relative paths, include artifact names
+        let start_path = PathBuf::from(&paths[0]);
+
+        // Sort projects alphabetically by path
+        let mut sorted_projects: Vec<_> = projects.iter().collect();
+        sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
+
+        for (project_dir, report) in sorted_projects {
+            let total_project_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
+
+            // Skip empty projects
+            if total_project_size == 0 {
+                continue;
+            }
+
+            // Get relative path from search root
+            let relative_path = project_dir
+                .strip_prefix(&start_path)
+                .unwrap_or(project_dir)
+                .display()
+                .to_string();
+            let path_display = if relative_path.is_empty() {
+                ".".to_string()
+            } else {
+                relative_path
+            };
+
+            println!("{}", path_display.bold());
 
             if files {
                 for artifact in &report.artifacts {
+                    let rel_artifact = artifact.path
+                        .strip_prefix(&start_path)
+                        .unwrap_or(&artifact.path);
                     println!(
                         "  - {} ({})",
-                        artifact.path.display(),
+                        rel_artifact.display(),
                         format_size(artifact.size, BINARY)
                     );
                 }
             } else {
-                // Aggregate counts per language within the project
-                let mut project_language_summary: HashMap<String, u64> = HashMap::new();
+                // Aggregate by language and collect artifact names
+                let mut language_summary: HashMap<String, (u64, Vec<String>)> = HashMap::new();
+
                 for artifact in &report.artifacts {
                     let path = &artifact.path;
                     let path_str = path.to_string_lossy();
                     let filename = path
                         .file_name()
                         .map(|f| f.to_string_lossy())
-                        .unwrap_or_default();
+                        .unwrap_or_default()
+                        .to_string();
 
                     // Find the matching pattern to get the language
-                    // Iterate over &ArtifactPattern
                     if let Some(matching_pattern) = patterns
                         .iter()
                         .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
                     {
-                        *project_language_summary
+                        let entry = language_summary
                             .entry(matching_pattern.language_name.clone())
-                            .or_insert(0) += artifact.size;
-                        // Also update global language counts
-                        let language_map = language_counts
-                            .entry(matching_pattern.artifact_type) // Access artifact_type field directly
-                            .or_default();
-                        language_map
-                            .entry(path.to_path_buf())
-                            .or_insert(matching_pattern.language_name.clone()); // Access language_name field directly
+                            .or_insert((0, Vec::new()));
+                        entry.0 += artifact.size;
+                        if !entry.1.contains(&filename) {
+                            entry.1.push(filename);
+                        }
                     }
                 }
 
-                for (language, size) in project_language_summary {
-                    println!("  - {}: {}", language, format_size(size, BINARY));
+                // Sort languages alphabetically
+                let mut languages: Vec<_> = language_summary.into_iter().collect();
+                languages.sort_by(|a, b| a.0.cmp(&b.0));
+
+                for (language, (size, artifacts)) in languages {
+                    let artifacts_str = artifacts.join(", ");
+                    println!("  - {}: {} ({})", language, format_size(size, BINARY), artifacts_str);
                 }
             }
 
             println!(
                 "  {}",
                 format!(
-                    "Total Project Size: {}",
+                    "Total: {}",
                     format_size(total_project_size, BINARY)
                 )
                 .green()
@@ -780,6 +1032,8 @@ fn main() -> Result<()> {
         args.verbose,
         args.files,
         args.dry_run,
+        args.list,
+        args.aggressive,
     )?;
 
     Ok(())
