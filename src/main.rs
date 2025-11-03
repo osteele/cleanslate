@@ -33,6 +33,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    time::{Duration, SystemTime},
 };
 
 #[derive(Parser, Debug)]
@@ -74,16 +75,146 @@ struct Args {
     /// Exclude directories by name (can be specified multiple times)
     #[arg(long, short = 'x', value_name = "DIR")]
     exclude: Vec<String>,
+
+    /// Only remove files modified more than N days ago
+    #[arg(long, value_name = "DAYS")]
+    older_than: Option<u64>,
+
+    /// Only remove files modified before a specific date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE")]
+    modified_before: Option<String>,
+}
+
+/// Time filter configuration
+#[derive(Debug, Clone)]
+struct TimeFilter {
+    /// Files must be older than this time to be removed
+    older_than: Option<SystemTime>,
+    /// Files must be modified before this time to be removed
+    modified_before: Option<SystemTime>,
+}
+
+impl TimeFilter {
+    /// Create a time filter from CLI arguments
+    fn from_args(older_than_days: Option<u64>, modified_before_str: Option<&str>) -> Result<Self> {
+        let older_than = if let Some(days) = older_than_days {
+            let cutoff = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+            Some(cutoff)
+        } else {
+            None
+        };
+
+        let modified_before = if let Some(date_str) = modified_before_str {
+            Some(parse_date(date_str)?)
+        } else {
+            None
+        };
+
+        Ok(TimeFilter {
+            older_than,
+            modified_before,
+        })
+    }
+
+    /// Check if a file passes the time filter
+    /// Returns true if the file should be considered for removal based on time
+    fn passes(&self, modified_time: SystemTime) -> bool {
+        if let Some(cutoff) = self.older_than {
+            if modified_time >= cutoff {
+                // File is too new (modified after cutoff)
+                return false;
+            }
+        }
+
+        if let Some(cutoff) = self.modified_before {
+            if modified_time >= cutoff {
+                // File was modified on or after the cutoff date
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Check if any time filters are active
+    fn is_active(&self) -> bool {
+        self.older_than.is_some() || self.modified_before.is_some()
+    }
+}
+
+/// Parse a date string in YYYY-MM-DD format to SystemTime
+fn parse_date(date_str: &str) -> Result<SystemTime> {
+    let parts: Vec<&str> = date_str.split('-').collect();
+    if parts.len() != 3 {
+        anyhow::bail!("Invalid date format. Expected YYYY-MM-DD, got: {}", date_str);
+    }
+
+    let year: i32 = parts[0].parse()
+        .context("Invalid year")?;
+    let month: u32 = parts[1].parse()
+        .context("Invalid month")?;
+    let day: u32 = parts[2].parse()
+        .context("Invalid day")?;
+
+    // Basic validation
+    if !(1..=12).contains(&month) {
+        anyhow::bail!("Month must be between 1 and 12, got: {}", month);
+    }
+    if !(1..=31).contains(&day) {
+        anyhow::bail!("Day must be between 1 and 31, got: {}", day);
+    }
+    if year < 1970 || year > 2100 {
+        anyhow::bail!("Year must be between 1970 and 2100, got: {}", year);
+    }
+
+    // Convert to days since Unix epoch (1970-01-01)
+    // This is a simplified calculation that works for our purposes
+    let mut days_since_epoch = 0i64;
+
+    // Add years since 1970
+    for y in 1970..year {
+        days_since_epoch += if is_leap_year(y) { 366 } else { 365 };
+    }
+
+    // Add months in current year
+    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days_since_epoch += days_in_month[(m - 1) as usize] as i64;
+        if m == 2 && is_leap_year(year) {
+            days_since_epoch += 1;
+        }
+    }
+
+    // Add days in current month
+    days_since_epoch += (day - 1) as i64;
+
+    let duration = Duration::from_secs((days_since_epoch * 24 * 60 * 60) as u64);
+    Ok(SystemTime::UNIX_EPOCH + duration)
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 struct ArtifactEntry {
     path: PathBuf,
     size: u64,
     removed: bool,
+    #[allow(dead_code)]
+    modified: Option<SystemTime>,
+    time_filtered: bool,
 }
 
 struct ProjectReport {
     artifacts: Vec<ArtifactEntry>,
+}
+
+/// Statistics about time-based filtering
+#[derive(Debug, Default)]
+struct TimeFilterStats {
+    total_found: usize,
+    passed_time_filter: usize,
+    excluded_by_time: usize,
 }
 
 /// Define artifact types for better classification
@@ -775,6 +906,7 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
 struct ScanResult {
     projects: HashMap<PathBuf, ProjectReport>,
     total_bytes: u64,
+    stats: TimeFilterStats,
 }
 
 /// Handle a directory artifact (Category 2 or Category 3)
@@ -788,12 +920,40 @@ fn handle_directory_artifact(
     verbose: bool,
     dry_run: bool,
     list: bool,
+    time_filter: &TimeFilter,
+    stats: &mut TimeFilterStats,
 ) -> Result<u64> {
     let mut total_bytes = 0u64;
+
+    stats.total_found += 1;
 
     // Detect VCS type once for this directory
     let (vcs_type, vcs_root) = detect_vcs(path);
     let vcs_root = vcs_root.unwrap_or_else(|| start_path.to_path_buf());
+
+    // Check time filter for directories (using directory's own modification time)
+    let passes_time_filter = if time_filter.is_active() {
+        if let Ok(metadata) = fs::symlink_metadata(path) {
+            if let Ok(mtime) = metadata.modified() {
+                time_filter.passes(mtime)
+            } else {
+                true // If we can't get mtime, assume it passes
+            }
+        } else {
+            true // If we can't get metadata, assume it passes
+        }
+    } else {
+        true // No time filter active
+    };
+
+    if passes_time_filter {
+        stats.passed_time_filter += 1;
+    } else {
+        stats.excluded_by_time += 1;
+        if verbose {
+            println!("Directory filtered by time: {}", path.display());
+        }
+    }
 
     // Category 2: Recreatable directories (spot-check)
     if is_recreatable_dir(path) {
@@ -812,7 +972,11 @@ fn handle_directory_artifact(
 
         // No tracked files → entire directory can be removed
         let dir_size = calculate_total_dir_size(path);
-        total_bytes += dir_size;
+
+        // Only count towards total if it passes time filter
+        if passes_time_filter {
+            total_bytes += dir_size;
+        }
 
         let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
             ProjectReport {
@@ -820,8 +984,9 @@ fn handle_directory_artifact(
             }
         });
 
-        // Remove entire directory if in delete mode
-        if delete && !dry_run {
+        // Remove entire directory if in delete mode AND passes time filter
+        let should_remove = passes_time_filter && (delete || dry_run);
+        if should_remove && delete && !dry_run {
             match fs::remove_dir_all(path) {
                 Ok(_) => {
                     if verbose {
@@ -834,14 +999,20 @@ fn handle_directory_artifact(
                     }
                 }
             }
-        } else if dry_run && list {
+        } else if should_remove && dry_run && list {
             println!("Would remove directory: {}", path.display());
         }
+
+        let dir_modified = fs::symlink_metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_size,
-            removed: delete || dry_run,
+            removed: should_remove,
+            modified: dir_modified,
+            time_filtered: !passes_time_filter,
         });
 
         skip_paths.insert(path.to_path_buf());
@@ -883,7 +1054,10 @@ fn handle_directory_artifact(
 
     // Only report and remove if there are untracked files
     if !files_to_remove.is_empty() {
-        total_bytes += dir_total_size;
+        // Only count towards total if it passes time filter
+        if passes_time_filter {
+            total_bytes += dir_total_size;
+        }
 
         let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
             ProjectReport {
@@ -891,8 +1065,9 @@ fn handle_directory_artifact(
             }
         });
 
-        // Remove files if in delete mode
-        if delete && !dry_run {
+        // Remove files if in delete mode AND passes time filter
+        let should_remove = passes_time_filter && (delete || dry_run);
+        if should_remove && delete && !dry_run {
             for (file_path, _) in &files_to_remove {
                 match fs::remove_file(file_path) {
                     Ok(_) => {
@@ -907,14 +1082,20 @@ fn handle_directory_artifact(
                     }
                 }
             }
-        } else if dry_run && list {
+        } else if should_remove && dry_run && list {
             println!("Would remove: {} ({} untracked files)", path.display(), files_to_remove.len());
         }
+
+        let dir_modified = fs::symlink_metadata(path)
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_total_size,
-            removed: delete || dry_run,
+            removed: should_remove,
+            modified: dir_modified,
+            time_filtered: !passes_time_filter,
         });
     }
 
@@ -932,13 +1113,43 @@ fn handle_file_artifact(
     verbose: bool,
     dry_run: bool,
     list: bool,
+    time_filter: &TimeFilter,
+    stats: &mut TimeFilterStats,
 ) -> Result<u64> {
+    stats.total_found += 1;
+
     // For files: check if tracked in version control
     if is_tracked_in_vcs(path) {
         if verbose {
             println!("Skipping tracked file: {}", path.display());
         }
         return Ok(0);
+    }
+
+    // Extract modification time
+    let modified_time = metadata.modified().ok();
+
+    // Check time filter if active
+    let passes_time_filter = if time_filter.is_active() {
+        if let Some(mtime) = modified_time {
+            time_filter.passes(mtime)
+        } else {
+            if verbose {
+                println!("Warning: Could not get modification time for {}", path.display());
+            }
+            true // If we can't get mtime, assume it passes
+        }
+    } else {
+        true // No time filter active
+    };
+
+    if passes_time_filter {
+        stats.passed_time_filter += 1;
+    } else {
+        stats.excluded_by_time += 1;
+        if verbose {
+            println!("File filtered by time: {}", path.display());
+        }
     }
 
     let size = metadata.len();
@@ -949,7 +1160,9 @@ fn handle_file_artifact(
         }
     });
 
-    let removed = if delete || dry_run {
+    // Only remove if passes time filter
+    let should_remove = passes_time_filter && (delete || dry_run);
+    let removed = if should_remove {
         if dry_run {
             if list {
                 println!("Would remove: {}", path.display());
@@ -971,16 +1184,19 @@ fn handle_file_artifact(
             }
         }
     } else {
-        false // Not removed if neither delete nor dry_run
+        false // Not removed if doesn't pass time filter or neither delete nor dry_run
     };
 
     project_report.artifacts.push(ArtifactEntry {
         path: path.to_path_buf(),
         size,
         removed,
+        modified: modified_time,
+        time_filtered: !passes_time_filter,
     });
 
-    Ok(size)
+    // Only count towards total if it passes time filter
+    Ok(if passes_time_filter { size } else { 0 })
 }
 
 /// Scan a single path for artifacts (used for parallel processing)
@@ -992,11 +1208,13 @@ fn scan_single_path(
     dry_run: bool,
     list: bool,
     exclude: &[String],
+    time_filter: &TimeFilter,
 ) -> Result<ScanResult> {
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut skip_paths: HashSet<PathBuf> = HashSet::new();
     let mut total_bytes: u64 = 0;
     let mut _total_files: u64 = 0;
+    let mut stats = TimeFilterStats::default();
 
     let start_path = PathBuf::from(start_path_str);
     if verbose {
@@ -1042,17 +1260,13 @@ fn scan_single_path(
         }
 
         // Skip excluded directories (user-specified)
-        // Only exclude directories, not files with matching names
+        // Check this early to avoid processing excluded directories as artifacts
         if entry.file_type().map_or(false, |ft| ft.is_dir()) && should_exclude_path(path, exclude) {
             if verbose {
                 println!("DEBUG: Skipping excluded directory: {}", path.display());
             }
-            // Skip traversing into this directory for performance
-            if let Err(e) = entry.skip_current_dir() {
-                if verbose {
-                    eprintln!("DEBUG: Failed to skip directory {}: {}", path.display(), e);
-                }
-            }
+            // Add to skip_paths to prevent traversing into subdirectories
+            skip_paths.insert(path.to_path_buf());
             continue;
         }
 
@@ -1062,6 +1276,7 @@ fn scan_single_path(
         }
 
         // Try to find project root, but constrain it to be within the scan directory
+        // Canonicalize to ensure consistent path format for HashMap keys and strip_prefix
         let project_root = find_project_root(path)
             .and_then(|root| {
                 if root.starts_with(&start_path) {
@@ -1071,6 +1286,10 @@ fn scan_single_path(
                 }
             })
             .unwrap_or_else(|| start_path.clone());
+
+        // Canonicalize the project root to match the format of start_path
+        // This ensures strip_prefix() works correctly in display code
+        let project_root = project_root.canonicalize().unwrap_or(project_root);
 
         // Add debugging to see each path we check
         if verbose {
@@ -1112,6 +1331,8 @@ fn scan_single_path(
                     verbose,
                     dry_run,
                     list,
+                    time_filter,
+                    &mut stats,
                 )?;
                 total_bytes += bytes;
             } else {
@@ -1124,6 +1345,8 @@ fn scan_single_path(
                     verbose,
                     dry_run,
                     list,
+                    time_filter,
+                    &mut stats,
                 )?;
                 total_bytes += bytes;
                 _total_files += 1;
@@ -1134,6 +1357,7 @@ fn scan_single_path(
     Ok(ScanResult {
         projects,
         total_bytes,
+        stats,
     })
 }
 
@@ -1146,9 +1370,14 @@ fn scan_for_artifacts(
     list: bool,
     aggressive: bool,
     exclude: Vec<String>,
+    older_than: Option<u64>,
+    modified_before: Option<String>,
 ) -> Result<()> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
+
+    // Create time filter
+    let time_filter = TimeFilter::from_args(older_than, modified_before.as_deref())?;
 
     // Canonicalize and deduplicate paths to prevent:
     // 1. Double-counting artifact sizes
@@ -1169,23 +1398,28 @@ fn scan_for_artifacts(
         }
     }
 
-    let unique_paths: Vec<String> = canonical_paths
+    let unique_paths: Vec<PathBuf> = canonical_paths.into_iter().collect();
+    let unique_path_strings: Vec<String> = unique_paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
     // Scan paths in parallel
-    let results: Vec<ScanResult> = unique_paths
+    let results: Vec<ScanResult> = unique_path_strings
         .par_iter()
-        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list, &exclude))
+        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list, &exclude, &time_filter))
         .collect::<Result<Vec<_>>>()?;
 
     // Merge results from parallel scans
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut total_bytes: u64 = 0;
+    let mut combined_stats = TimeFilterStats::default();
 
     for result in results {
         total_bytes += result.total_bytes;
+        combined_stats.total_found += result.stats.total_found;
+        combined_stats.passed_time_filter += result.stats.passed_time_filter;
+        combined_stats.excluded_by_time += result.stats.excluded_by_time;
         for (project_path, project_report) in result.projects {
             projects
                 .entry(project_path)
@@ -1302,7 +1536,12 @@ fn scan_for_artifacts(
         // Table format (default): alphabetized, relative paths, omit empty projects
         use terminal_size::{Width, terminal_size};
 
-        let start_path = PathBuf::from(&paths[0]);
+        let start_path = if unique_paths.len() == 1 {
+            &unique_paths[0]
+        } else {
+            // For multiple paths, use current directory as base
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
 
         // Collect and sort projects by path, filtering out empty projects
         let mut sorted_projects: Vec<_> = projects
@@ -1337,36 +1576,57 @@ fn scan_for_artifacts(
 
         // Fixed widths for size columns
         let removable_width = 12;
+        let too_recent_width = if time_filter.is_active() { 12 } else { 0 };
         let total_width = 12;
 
         // Calculate What column width
-        let separator_width = 6; // spaces between columns
+        let separator_width = if time_filter.is_active() { 8 } else { 6 }; // spaces between columns
         let what_width = terminal_width
             .saturating_sub(max_path_width)
             .saturating_sub(removable_width)
+            .saturating_sub(too_recent_width)
             .saturating_sub(total_width)
             .saturating_sub(separator_width)
             .max(20);
 
         // Print header
-        println!(
-            "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
-            "Path", "Removable", "Total", "What",
-            path_w = max_path_width,
-            rem_w = removable_width,
-            tot_w = total_width
-        );
+        if time_filter.is_active() {
+            println!(
+                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}",
+                "Path", "Removable", "Too Recent", "Total", "What",
+                path_w = max_path_width,
+                rem_w = removable_width,
+                rec_w = too_recent_width,
+                tot_w = total_width
+            );
+        } else {
+            println!(
+                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+                "Path", "Removable", "Total", "What",
+                path_w = max_path_width,
+                rem_w = removable_width,
+                tot_w = total_width
+            );
+        }
         println!("{}", "─".repeat(terminal_width.min(120)));
 
         let mut total_removable: u64 = 0;
+        let mut total_too_recent: u64 = 0;
         let mut total_size: u64 = 0;
 
         // Print each project
         for (project_dir, report) in sorted_projects {
-            let removable_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
+            let removable_size: u64 = report.artifacts.iter()
+                .filter(|a| !a.time_filtered)
+                .map(|a| a.size)
+                .sum();
+            let too_recent_size: u64 = report.artifacts.iter()
+                .filter(|a| a.time_filtered)
+                .map(|a| a.size)
+                .sum();
 
             // Skip displaying the root directory line (but include in totals)
-            let is_root = project_dir == &start_path;
+            let is_root = project_dir == start_path;
 
             // Calculate full size (skip for root to avoid long scan)
             let full_size = if is_root {
@@ -1376,6 +1636,7 @@ fn scan_for_artifacts(
             };
 
             total_removable += removable_size;
+            total_too_recent += too_recent_size;
             total_size += full_size;
 
             // Skip displaying root directory
@@ -1466,39 +1727,119 @@ fn scan_for_artifacts(
                 path_display.normal()
             };
 
+            if time_filter.is_active() {
+                println!(
+                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}",
+                    path_styled,
+                    removable_display,
+                    format_size(too_recent_size, BINARY),
+                    format_size(full_size, BINARY),
+                    what_display,
+                    path_w = max_path_width,
+                    rem_w = removable_width,
+                    rec_w = too_recent_width,
+                    tot_w = total_width
+                );
+            } else {
+                println!(
+                    "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+                    path_styled,
+                    removable_display,
+                    format_size(full_size, BINARY),
+                    what_display,
+                    path_w = max_path_width,
+                    rem_w = removable_width,
+                    tot_w = total_width
+                );
+            }
+        }
+
+        println!("{}", "─".repeat(terminal_width.min(120)));
+        if time_filter.is_active() {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
-                path_styled,
-                removable_display,
-                format_size(full_size, BINARY),
-                what_display,
+                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}",
+                "Total",
+                format_size(total_removable, BINARY),
+                format_size(total_too_recent, BINARY),
+                format_size(total_size, BINARY),
+                path_w = max_path_width,
+                rem_w = removable_width,
+                rec_w = too_recent_width,
+                tot_w = total_width
+            );
+        } else {
+            println!(
+                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}",
+                "Total",
+                format_size(total_removable, BINARY),
+                format_size(total_size, BINARY),
                 path_w = max_path_width,
                 rem_w = removable_width,
                 tot_w = total_width
             );
         }
 
-        println!("{}", "─".repeat(terminal_width.min(120)));
-        println!(
-            "{:<path_w$}  {:>rem_w$}  {:>tot_w$}",
-            "Total",
-            format_size(total_removable, BINARY),
-            format_size(total_size, BINARY),
-            path_w = max_path_width,
-            rem_w = removable_width,
-            tot_w = total_width
-        );
+        // Show deletion summary for table format
+        if delete && !dry_run {
+            let removed_bytes: u64 = projects
+                .values()
+                .flat_map(|r| &r.artifacts)
+                .filter(|a| a.removed)
+                .map(|a| a.size)
+                .sum();
+            println!(
+                "\nTotal Size Removed: {}",
+                format_size(removed_bytes, BINARY).bold().red()
+            );
+        } else if dry_run {
+            println!("\nDry run mode: No files were deleted.");
+        } else if !delete && total_removable > 0 {
+            // Show command to actually delete when not in delete mode and there are removable files
+            let mut cmd = String::from("cleanslate --delete");
+            if let Some(days) = older_than {
+                cmd.push_str(&format!(" --older-than {}", days));
+            }
+            if let Some(ref date) = modified_before {
+                cmd.push_str(&format!(" --modified-before {}", date));
+            }
+            if aggressive {
+                cmd.push_str(" --aggressive");
+            }
+            for ex in &exclude {
+                cmd.push_str(&format!(" --exclude {}", ex));
+            }
+            if paths.len() > 0 && paths[0] != "." {
+                for path in paths {
+                    cmd.push_str(&format!(" {}", path));
+                }
+            }
+            println!("\nTo delete: {}", cmd);
+        }
+
         println!("\nRun with --list to see detailed breakdown by project");
     } else {
         // List format: alphabetized, relative paths, include artifact names
-        let start_path = PathBuf::from(&paths[0]);
+        let start_path = if unique_paths.len() == 1 {
+            &unique_paths[0]
+        } else {
+            // For multiple paths, use current directory as base
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        };
 
         // Sort projects alphabetically by path
         let mut sorted_projects: Vec<_> = projects.iter().collect();
         sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
 
         for (project_dir, report) in sorted_projects {
-            let total_project_size: u64 = report.artifacts.iter().map(|a| a.size).sum();
+            let removable_size: u64 = report.artifacts.iter()
+                .filter(|a| !a.time_filtered)
+                .map(|a| a.size)
+                .sum();
+            let too_recent_size: u64 = report.artifacts.iter()
+                .filter(|a| a.time_filtered)
+                .map(|a| a.size)
+                .sum();
+            let total_project_size = removable_size + too_recent_size;
 
             // Skip empty projects
             if total_project_size == 0 {
@@ -1568,14 +1909,23 @@ fn scan_for_artifacts(
                 }
             }
 
-            println!(
-                "  {}",
-                format!(
-                    "Total: {}",
-                    format_size(total_project_size, BINARY)
-                )
-                .green()
-            );
+            if time_filter.is_active() && too_recent_size > 0 {
+                println!(
+                    "  {} (Removable: {}, Too Recent: {})",
+                    format!("Total: {}", format_size(total_project_size, BINARY)).green(),
+                    format_size(removable_size, BINARY),
+                    format_size(too_recent_size, BINARY)
+                );
+            } else {
+                println!(
+                    "  {}",
+                    format!(
+                        "Total: {}",
+                        format_size(total_project_size, BINARY)
+                    )
+                    .green()
+                );
+            }
             println!(); // Add a blank line between projects
         }
 
@@ -1597,7 +1947,37 @@ fn scan_for_artifacts(
             );
         } else if dry_run {
             println!("Dry run mode: No files were deleted.");
+        } else if !delete && total_bytes > 0 {
+            // Show command to actually delete when not in delete mode and there are removable files
+            let mut cmd = String::from("cleanslate --delete");
+            if let Some(days) = older_than {
+                cmd.push_str(&format!(" --older-than {}", days));
+            }
+            if let Some(ref date) = modified_before {
+                cmd.push_str(&format!(" --modified-before {}", date));
+            }
+            if aggressive {
+                cmd.push_str(" --aggressive");
+            }
+            for ex in &exclude {
+                cmd.push_str(&format!(" --exclude {}", ex));
+            }
+            if paths.len() > 0 && paths[0] != "." {
+                for path in paths {
+                    cmd.push_str(&format!(" {}", path));
+                }
+            }
+            println!("\nTo delete: {}", cmd);
         }
+    }
+
+    // Show time filter statistics if active (for all output formats)
+    if time_filter.is_active() && !projects.is_empty() {
+        println!();
+        println!("Time Filter: {} of {} artifacts passed the filter ({} excluded)",
+            combined_stats.passed_time_filter,
+            combined_stats.total_found,
+            combined_stats.excluded_by_time);
     }
 
     Ok(())
@@ -1615,6 +1995,8 @@ fn main() -> Result<()> {
         args.list,
         args.aggressive,
         args.exclude,
+        args.older_than,
+        args.modified_before,
     )?;
 
     Ok(())
