@@ -23,6 +23,7 @@
 //! resulting in 100-10,000x speedup for large projects.
 
 use anyhow::{Context, Result};
+use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use colored::Colorize;
 use humansize::{format_size, BINARY};
@@ -144,56 +145,28 @@ impl TimeFilter {
 
 /// Parse a date string in YYYY-MM-DD format to SystemTime
 fn parse_date(date_str: &str) -> Result<SystemTime> {
-    let parts: Vec<&str> = date_str.split('-').collect();
-    if parts.len() != 3 {
-        anyhow::bail!("Invalid date format. Expected YYYY-MM-DD, got: {}", date_str);
-    }
+    // Use chrono for robust date parsing with proper validation
+    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+        .with_context(|| format!("Invalid date format. Expected YYYY-MM-DD, got: {}", date_str))?;
 
-    let year: i32 = parts[0].parse()
-        .context("Invalid year")?;
-    let month: u32 = parts[1].parse()
-        .context("Invalid month")?;
-    let day: u32 = parts[2].parse()
-        .context("Invalid day")?;
-
-    // Basic validation
-    if !(1..=12).contains(&month) {
-        anyhow::bail!("Month must be between 1 and 12, got: {}", month);
-    }
-    if !(1..=31).contains(&day) {
-        anyhow::bail!("Day must be between 1 and 31, got: {}", day);
-    }
+    // Convert to SystemTime via Unix timestamp
+    // NaiveDate doesn't have year limits, so add validation
+    let year = date.year();
     if year < 1970 || year > 2100 {
         anyhow::bail!("Year must be between 1970 and 2100, got: {}", year);
     }
 
-    // Convert to days since Unix epoch (1970-01-01)
-    // This is a simplified calculation that works for our purposes
-    let mut days_since_epoch = 0i64;
+    // Calculate days since Unix epoch (1970-01-01)
+    let epoch_date = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .context("Failed to create epoch date")?;
+    let days_since_epoch = date.signed_duration_since(epoch_date).num_days();
 
-    // Add years since 1970
-    for y in 1970..year {
-        days_since_epoch += if is_leap_year(y) { 366 } else { 365 };
+    if days_since_epoch < 0 {
+        anyhow::bail!("Date must be on or after 1970-01-01");
     }
-
-    // Add months in current year
-    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days_since_epoch += days_in_month[(m - 1) as usize] as i64;
-        if m == 2 && is_leap_year(year) {
-            days_since_epoch += 1;
-        }
-    }
-
-    // Add days in current month
-    days_since_epoch += (day - 1) as i64;
 
     let duration = Duration::from_secs((days_since_epoch * 24 * 60 * 60) as u64);
     Ok(SystemTime::UNIX_EPOCH + duration)
-}
-
-fn is_leap_year(year: i32) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
 struct ArtifactEntry {
@@ -1615,7 +1588,7 @@ fn scan_for_artifacts(
         let mut total_size: u64 = 0;
 
         // Print each project
-        for (project_dir, report) in sorted_projects {
+        for (project_dir, report) in &sorted_projects {
             let removable_size: u64 = report.artifacts.iter()
                 .filter(|a| !a.time_filtered)
                 .map(|a| a.size)
@@ -1625,12 +1598,12 @@ fn scan_for_artifacts(
                 .map(|a| a.size)
                 .sum();
 
-            // Skip displaying the root directory line (but include in totals)
-            let is_root = project_dir == start_path;
+            // Check if this is the root directory
+            let is_root = *project_dir == start_path;
 
-            // Calculate full size (skip for root to avoid long scan)
+            // Calculate full size (skip for root to avoid long scan, we'll calculate deferred)
             let full_size = if is_root {
-                0 // We'll calculate total at the end
+                0 // Will be calculated after loop
             } else {
                 calculate_total_dir_size(project_dir)
             };
@@ -1638,11 +1611,6 @@ fn scan_for_artifacts(
             total_removable += removable_size;
             total_too_recent += too_recent_size;
             total_size += full_size;
-
-            // Skip displaying root directory
-            if is_root {
-                continue;
-            }
 
             let relative_path = project_dir
                 .strip_prefix(&start_path)
@@ -1752,6 +1720,57 @@ fn scan_for_artifacts(
                     tot_w = total_width
                 );
             }
+
+            // Show individual files if --files flag is set
+            if files {
+                for artifact in &report.artifacts {
+                    let file_path_str = artifact.path
+                        .strip_prefix(&start_path)
+                        .unwrap_or(&artifact.path)
+                        .display()
+                        .to_string();
+
+                    let indent = "  ├─ ";
+                    let filtered_marker = if artifact.time_filtered { " [too recent]" } else { "" };
+
+                    if time_filter.is_active() {
+                        let file_removable = if artifact.time_filtered { 0 } else { artifact.size };
+                        let file_too_recent = if artifact.time_filtered { artifact.size } else { 0 };
+                        println!(
+                            "{}{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}{}",
+                            indent,
+                            "",
+                            format_size(file_removable, BINARY),
+                            format_size(file_too_recent, BINARY),
+                            format_size(artifact.size, BINARY),
+                            file_path_str,
+                            filtered_marker,
+                            path_w = max_path_width.saturating_sub(indent.len()),
+                            rem_w = removable_width,
+                            rec_w = too_recent_width,
+                            tot_w = total_width
+                        );
+                    } else {
+                        println!(
+                            "{}{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}{}",
+                            indent,
+                            "",
+                            if artifact.time_filtered { format!("{:>w$}", "", w = removable_width) } else { format_size(artifact.size, BINARY) },
+                            format_size(artifact.size, BINARY),
+                            file_path_str,
+                            filtered_marker,
+                            path_w = max_path_width.saturating_sub(indent.len()),
+                            rem_w = removable_width,
+                            tot_w = total_width
+                        );
+                    }
+                }
+            }
+        }
+
+        // Calculate deferred total size for root directory if it was scanned
+        if sorted_projects.iter().any(|(p, _)| *p == start_path) {
+            total_size += calculate_total_dir_size(&start_path);
         }
 
         println!("{}", "─".repeat(terminal_width.min(120)));
