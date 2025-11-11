@@ -76,8 +76,8 @@ fn test_is_artifact() {
 
 #[test]
 fn test_find_project_root() {
-    use std::fs;
     use std::env;
+    use std::fs;
 
     // Create a temporary directory for testing
     let temp_dir = env::temp_dir().join("cleanslate_test");

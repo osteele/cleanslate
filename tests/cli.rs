@@ -110,11 +110,7 @@ fn test_exclude_single_directory() {
 
     // Run with --exclude to skip node_modules
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd
-        .arg(dir.path())
-        .arg("-x")
-        .arg("node_modules")
-        .assert();
+    let assert = cmd.arg(dir.path()).arg("-x").arg("node_modules").assert();
 
     // Should succeed and find other artifacts (node_modules is excluded)
     // Note: "node_modules" may appear in the help text showing the --exclude flag,
@@ -141,9 +137,7 @@ fn test_exclude_multiple_directories() {
 
     // Should succeed and find only target (others are excluded)
     // Note: Excluded directory names may appear in the help text
-    assert
-        .success()
-        .stdout(predicate::str::contains("target"));
+    assert.success().stdout(predicate::str::contains("target"));
 }
 
 #[test]
@@ -176,7 +170,10 @@ fn test_exclude_does_not_affect_files() {
     // Should exclude the dist directory and find node_modules
     assert
         .success()
-        .stdout(predicate::str::contains("Skipping excluded directory").and(predicate::str::contains("dist")))
+        .stdout(
+            predicate::str::contains("Skipping excluded directory")
+                .and(predicate::str::contains("dist")),
+        )
         .stdout(predicate::str::contains("node_modules"));
 
     // The dist directory should still exist (we didn't delete)
@@ -193,7 +190,8 @@ fn test_exclude_with_nested_directories() {
     // Create nested structure: project/node_modules/package/node_modules
     fs::create_dir_all(dir.path().join("node_modules/package/node_modules")).unwrap();
     fs::write(
-        dir.path().join("node_modules/package/node_modules/nested.txt"),
+        dir.path()
+            .join("node_modules/package/node_modules/nested.txt"),
         "nested",
     )
     .unwrap();
@@ -208,11 +206,7 @@ fn test_exclude_with_nested_directories() {
 
     // Run with --exclude node_modules
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd
-        .arg(dir.path())
-        .arg("-x")
-        .arg("node_modules")
-        .assert();
+    let assert = cmd.arg(dir.path()).arg("-x").arg("node_modules").assert();
 
     // Should exclude all node_modules (top-level and nested)
     // Note: "node_modules" may appear in the help text showing the --exclude flag

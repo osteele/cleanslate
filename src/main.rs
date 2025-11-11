@@ -77,9 +77,11 @@ struct Args {
     #[arg(long, short = 'x', value_name = "DIR")]
     exclude: Vec<String>,
 
-    /// Only remove files modified more than N days ago
-    #[arg(long, value_name = "DAYS")]
-    older_than: Option<u64>,
+    /// Only remove files modified more than the specified duration ago
+    /// Supports: plain numbers (days), or with unit suffix: h (hours), d (days), w (weeks), m (months)
+    /// Examples: 15, 15d, 2w, 3m, 48h
+    #[arg(long, value_name = "DURATION")]
+    older_than: Option<String>,
 
     /// Only remove files modified before a specific date (YYYY-MM-DD)
     #[arg(long, value_name = "DATE")]
@@ -97,9 +99,10 @@ struct TimeFilter {
 
 impl TimeFilter {
     /// Create a time filter from CLI arguments
-    fn from_args(older_than_days: Option<u64>, modified_before_str: Option<&str>) -> Result<Self> {
-        let older_than = if let Some(days) = older_than_days {
-            let cutoff = SystemTime::now() - Duration::from_secs(days * 24 * 60 * 60);
+    fn from_args(older_than_str: Option<&str>, modified_before_str: Option<&str>) -> Result<Self> {
+        let older_than = if let Some(duration_str) = older_than_str {
+            let duration = parse_duration(duration_str)?;
+            let cutoff = SystemTime::now() - duration;
             Some(cutoff)
         } else {
             None
@@ -146,19 +149,22 @@ impl TimeFilter {
 /// Parse a date string in YYYY-MM-DD format to SystemTime
 fn parse_date(date_str: &str) -> Result<SystemTime> {
     // Use chrono for robust date parsing with proper validation
-    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
-        .with_context(|| format!("Invalid date format. Expected YYYY-MM-DD, got: {}", date_str))?;
+    let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d").with_context(|| {
+        format!(
+            "Invalid date format. Expected YYYY-MM-DD, got: {}",
+            date_str
+        )
+    })?;
 
     // Convert to SystemTime via Unix timestamp
     // NaiveDate doesn't have year limits, so add validation
     let year = date.year();
-    if year < 1970 || year > 2100 {
+    if !(1970..=2100).contains(&year) {
         anyhow::bail!("Year must be between 1970 and 2100, got: {}", year);
     }
 
     // Calculate days since Unix epoch (1970-01-01)
-    let epoch_date = NaiveDate::from_ymd_opt(1970, 1, 1)
-        .context("Failed to create epoch date")?;
+    let epoch_date = NaiveDate::from_ymd_opt(1970, 1, 1).context("Failed to create epoch date")?;
     let days_since_epoch = date.signed_duration_since(epoch_date).num_days();
 
     if days_since_epoch < 0 {
@@ -167,6 +173,59 @@ fn parse_date(date_str: &str) -> Result<SystemTime> {
 
     let duration = Duration::from_secs((days_since_epoch * 24 * 60 * 60) as u64);
     Ok(SystemTime::UNIX_EPOCH + duration)
+}
+
+/// Parse a duration string with optional unit suffix
+/// Supports: h (hours), d (days), w (weeks), m (months)
+/// Plain numbers default to days for backward compatibility
+/// Examples: "15", "15d", "2w", "3m", "48h"
+fn parse_duration(duration_str: &str) -> Result<Duration> {
+    let duration_str = duration_str.trim();
+
+    // Try to extract number and unit
+    let (num_str, unit) = if let Some(pos) = duration_str.find(|c: char| c.is_alphabetic()) {
+        let (num, unit) = duration_str.split_at(pos);
+        (num, Some(unit))
+    } else {
+        // No unit specified, default to days for backward compatibility
+        (duration_str, None)
+    };
+
+    // Parse the numeric part
+    let value: u64 = num_str.trim().parse().with_context(|| {
+        format!(
+            "Invalid duration format. Expected a number, got: {}",
+            num_str
+        )
+    })?;
+
+    // Calculate total seconds based on unit
+    let seconds = match unit {
+        None | Some("d") | Some("D") => {
+            // Default to days for backward compatibility
+            value * 24 * 60 * 60
+        }
+        Some("h") | Some("H") => {
+            // Hours
+            value * 60 * 60
+        }
+        Some("w") | Some("W") => {
+            // Weeks (7 days)
+            value * 7 * 24 * 60 * 60
+        }
+        Some("m") | Some("M") => {
+            // Months (approximate as 30 days)
+            value * 30 * 24 * 60 * 60
+        }
+        Some(unknown) => {
+            anyhow::bail!(
+                "Invalid duration unit '{}'. Supported units: h (hours), d (days), w (weeks), m (months)",
+                unknown
+            );
+        }
+    };
+
+    Ok(Duration::from_secs(seconds))
 }
 
 struct ArtifactEntry {
@@ -295,9 +354,7 @@ const RECREATABLE_DIRS: &[&str] = &[
 /// Helper function to check if a path matches any recreatable directory pattern
 fn is_recreatable_dir(path: &Path) -> bool {
     // Get the directory name for simple comparisons
-    let dir_name = path.file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
+    let dir_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
     for pattern in RECREATABLE_DIRS {
         if pattern.contains('/') {
@@ -317,15 +374,7 @@ fn is_recreatable_dir(path: &Path) -> bool {
 /// VCS internal directories that should never be traversed or removed.
 /// See docs/architecture.md for detailed explanation of the three directory categories.
 const VCS_INTERNALS: &[&str] = &[
-    ".git",
-    ".jj",
-    ".svn",
-    ".hg",
-    ".bzr",
-    "_darcs",
-    ".pijul",
-    "CVS",
-    ".fossil",
+    ".git", ".jj", ".svn", ".hg", ".bzr", "_darcs", ".pijul", "CVS", ".fossil",
 ];
 
 /// Parse artifact patterns from the embedded TOML content
@@ -569,7 +618,6 @@ fn is_project_root(path: &Path) -> bool {
 
     false
 }
-
 
 /// Check if a path is tracked in git by running git ls-files
 /// Returns true if the file is tracked in version control
@@ -931,7 +979,10 @@ fn handle_directory_artifact(
     // Category 2: Recreatable directories (spot-check)
     if is_recreatable_dir(path) {
         if verbose {
-            println!("DEBUG: Spot-checking Category 2 directory: {}", path.display());
+            println!(
+                "DEBUG: Spot-checking Category 2 directory: {}",
+                path.display()
+            );
         }
 
         // Spot-check: Does this directory contain ANY tracked files?
@@ -951,11 +1002,11 @@ fn handle_directory_artifact(
             total_bytes += dir_size;
         }
 
-        let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
-            ProjectReport {
+        let project_report = projects
+            .entry(project_root.to_path_buf())
+            .or_insert_with(|| ProjectReport {
                 artifacts: Vec::new(),
-            }
-        });
+            });
 
         // Remove entire directory if in delete mode AND passes time filter
         let should_remove = passes_time_filter && (delete || dry_run);
@@ -994,7 +1045,10 @@ fn handle_directory_artifact(
 
     // Category 3: Other directories (batch-check contents)
     if verbose {
-        println!("DEBUG: Batch-checking Category 3 directory: {}", path.display());
+        println!(
+            "DEBUG: Batch-checking Category 3 directory: {}",
+            path.display()
+        );
     }
 
     // Get all tracked files in this directory with a single VCS call
@@ -1032,11 +1086,11 @@ fn handle_directory_artifact(
             total_bytes += dir_total_size;
         }
 
-        let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
-            ProjectReport {
+        let project_report = projects
+            .entry(project_root.to_path_buf())
+            .or_insert_with(|| ProjectReport {
                 artifacts: Vec::new(),
-            }
-        });
+            });
 
         // Remove files if in delete mode AND passes time filter
         let should_remove = passes_time_filter && (delete || dry_run);
@@ -1056,7 +1110,11 @@ fn handle_directory_artifact(
                 }
             }
         } else if should_remove && dry_run && list {
-            println!("Would remove: {} ({} untracked files)", path.display(), files_to_remove.len());
+            println!(
+                "Would remove: {} ({} untracked files)",
+                path.display(),
+                files_to_remove.len()
+            );
         }
 
         let dir_modified = fs::symlink_metadata(path)
@@ -1108,7 +1166,10 @@ fn handle_file_artifact(
             time_filter.passes(mtime)
         } else {
             if verbose {
-                println!("Warning: Could not get modification time for {}", path.display());
+                println!(
+                    "Warning: Could not get modification time for {}",
+                    path.display()
+                );
             }
             true // If we can't get mtime, assume it passes
         }
@@ -1127,11 +1188,11 @@ fn handle_file_artifact(
 
     let size = metadata.len();
 
-    let project_report = projects.entry(project_root.to_path_buf()).or_insert_with(|| {
-        ProjectReport {
+    let project_report = projects
+        .entry(project_root.to_path_buf())
+        .or_insert_with(|| ProjectReport {
             artifacts: Vec::new(),
-        }
-    });
+        });
 
     // Only remove if passes time filter
     let should_remove = passes_time_filter && (delete || dry_run);
@@ -1343,14 +1404,14 @@ fn scan_for_artifacts(
     list: bool,
     aggressive: bool,
     exclude: Vec<String>,
-    older_than: Option<u64>,
+    older_than: Option<String>,
     modified_before: Option<String>,
 ) -> Result<()> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
 
     // Create time filter
-    let time_filter = TimeFilter::from_args(older_than, modified_before.as_deref())?;
+    let time_filter = TimeFilter::from_args(older_than.as_deref(), modified_before.as_deref())?;
 
     // Canonicalize and deduplicate paths to prevent:
     // 1. Double-counting artifact sizes
@@ -1380,7 +1441,18 @@ fn scan_for_artifacts(
     // Scan paths in parallel
     let results: Vec<ScanResult> = unique_path_strings
         .par_iter()
-        .map(|path| scan_single_path(path, &patterns, delete, verbose, dry_run, list, &exclude, &time_filter))
+        .map(|path| {
+            scan_single_path(
+                path,
+                &patterns,
+                delete,
+                verbose,
+                dry_run,
+                list,
+                &exclude,
+                &time_filter,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
 
     // Merge results from parallel scans
@@ -1413,7 +1485,13 @@ fn scan_for_artifacts(
             for entry in &project_report.artifacts {
                 if entry.removed {
                     // If it's a directory artifact, add it
-                    if entry.path.is_dir() || entry.path.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false) {
+                    if entry.path.is_dir()
+                        || entry
+                            .path
+                            .symlink_metadata()
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                    {
                         dirs_to_check.insert(entry.path.clone());
                         // Also add all parent directories up to the project root
                         let mut current = entry.path.as_path();
@@ -1462,11 +1540,13 @@ fn scan_for_artifacts(
                     let remaining: Vec<_> = entries.filter_map(|e| e.ok()).collect();
 
                     // Check if empty or only contains .DS_Store/Thumbs.db
-                    let is_effectively_empty = remaining.is_empty() ||
-                        remaining.iter().all(|entry| {
-                            entry.file_name().to_str().map(|name| {
-                                matches!(name, ".DS_Store" | "Thumbs.db")
-                            }).unwrap_or(false)
+                    let is_effectively_empty = remaining.is_empty()
+                        || remaining.iter().all(|entry| {
+                            entry
+                                .file_name()
+                                .to_str()
+                                .map(|name| matches!(name, ".DS_Store" | "Thumbs.db"))
+                                .unwrap_or(false)
                         });
 
                     if is_effectively_empty {
@@ -1488,7 +1568,11 @@ fn scan_for_artifacts(
                             }
                             Err(err) => {
                                 if verbose {
-                                    eprintln!("Warning: Failed to remove directory {}: {}", dir.display(), err);
+                                    eprintln!(
+                                        "Warning: Failed to remove directory {}: {}",
+                                        dir.display(),
+                                        err
+                                    );
                                 }
                             }
                         }
@@ -1502,12 +1586,11 @@ fn scan_for_artifacts(
         }
     }
 
-
     if projects.is_empty() {
         println!("No artifacts found.");
     } else if !list {
         // Table format (default): alphabetized, relative paths, omit empty projects
-        use terminal_size::{Width, terminal_size};
+        use terminal_size::{terminal_size, Width};
 
         let start_path = if unique_paths.len() == 1 {
             &unique_paths[0]
@@ -1566,7 +1649,11 @@ fn scan_for_artifacts(
         if time_filter.is_active() {
             println!(
                 "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}",
-                "Path", "Removable", "Too Recent", "Total", "What",
+                "Path",
+                "Removable",
+                "Too Recent",
+                "Total",
+                "What",
                 path_w = max_path_width,
                 rem_w = removable_width,
                 rec_w = too_recent_width,
@@ -1575,7 +1662,10 @@ fn scan_for_artifacts(
         } else {
             println!(
                 "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
-                "Path", "Removable", "Total", "What",
+                "Path",
+                "Removable",
+                "Total",
+                "What",
                 path_w = max_path_width,
                 rem_w = removable_width,
                 tot_w = total_width
@@ -1589,11 +1679,15 @@ fn scan_for_artifacts(
 
         // Print each project
         for (project_dir, report) in &sorted_projects {
-            let removable_size: u64 = report.artifacts.iter()
+            let removable_size: u64 = report
+                .artifacts
+                .iter()
                 .filter(|a| !a.time_filtered)
                 .map(|a| a.size)
                 .sum();
-            let too_recent_size: u64 = report.artifacts.iter()
+            let too_recent_size: u64 = report
+                .artifacts
+                .iter()
                 .filter(|a| a.time_filtered)
                 .map(|a| a.size)
                 .sum();
@@ -1628,7 +1722,8 @@ fn scan_for_artifacts(
                 .artifacts
                 .iter()
                 .map(|a| {
-                    let name = a.path
+                    let name = a
+                        .path
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
@@ -1661,7 +1756,8 @@ fn scan_for_artifacts(
                     let separator_len = if what_parts.is_empty() { 0 } else { 2 }; // ", "
                     let remaining_width = what_width.saturating_sub(current_len + separator_len);
 
-                    if remaining_width >= 6 { // Minimum for showing something useful (e.g., "foo...")
+                    if remaining_width >= 6 {
+                        // Minimum for showing something useful (e.g., "foo...")
                         let truncated = truncate_name_with_suffix(name, remaining_width);
                         let truncated_formatted = if *size > large_threshold {
                             truncated.bold().to_string()
@@ -1724,18 +1820,31 @@ fn scan_for_artifacts(
             // Show individual files if --files flag is set
             if files {
                 for artifact in &report.artifacts {
-                    let file_path_str = artifact.path
+                    let file_path_str = artifact
+                        .path
                         .strip_prefix(&start_path)
                         .unwrap_or(&artifact.path)
                         .display()
                         .to_string();
 
                     let indent = "  ├─ ";
-                    let filtered_marker = if artifact.time_filtered { " [too recent]" } else { "" };
+                    let filtered_marker = if artifact.time_filtered {
+                        " [too recent]"
+                    } else {
+                        ""
+                    };
 
                     if time_filter.is_active() {
-                        let file_removable = if artifact.time_filtered { 0 } else { artifact.size };
-                        let file_too_recent = if artifact.time_filtered { artifact.size } else { 0 };
+                        let file_removable = if artifact.time_filtered {
+                            0
+                        } else {
+                            artifact.size
+                        };
+                        let file_too_recent = if artifact.time_filtered {
+                            artifact.size
+                        } else {
+                            0
+                        };
                         println!(
                             "{}{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}{}",
                             indent,
@@ -1755,7 +1864,11 @@ fn scan_for_artifacts(
                             "{}{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}{}",
                             indent,
                             "",
-                            if artifact.time_filtered { format!("{:>w$}", "", w = removable_width) } else { format_size(artifact.size, BINARY) },
+                            if artifact.time_filtered {
+                                format!("{:>w$}", "", w = removable_width)
+                            } else {
+                                format_size(artifact.size, BINARY)
+                            },
                             format_size(artifact.size, BINARY),
                             file_path_str,
                             filtered_marker,
@@ -1850,11 +1963,15 @@ fn scan_for_artifacts(
         sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
 
         for (project_dir, report) in sorted_projects {
-            let removable_size: u64 = report.artifacts.iter()
+            let removable_size: u64 = report
+                .artifacts
+                .iter()
                 .filter(|a| !a.time_filtered)
                 .map(|a| a.size)
                 .sum();
-            let too_recent_size: u64 = report.artifacts.iter()
+            let too_recent_size: u64 = report
+                .artifacts
+                .iter()
                 .filter(|a| a.time_filtered)
                 .map(|a| a.size)
                 .sum();
@@ -1881,7 +1998,8 @@ fn scan_for_artifacts(
 
             if files {
                 for artifact in &report.artifacts {
-                    let rel_artifact = artifact.path
+                    let rel_artifact = artifact
+                        .path
                         .strip_prefix(&start_path)
                         .unwrap_or(&artifact.path);
                     println!(
@@ -1924,7 +2042,12 @@ fn scan_for_artifacts(
 
                 for (language, (size, artifacts)) in languages {
                     let artifacts_str = artifacts.join(", ");
-                    println!("  - {}: {} ({})", language, format_size(size, BINARY), artifacts_str);
+                    println!(
+                        "  - {}: {} ({})",
+                        language,
+                        format_size(size, BINARY),
+                        artifacts_str
+                    );
                 }
             }
 
@@ -1938,11 +2061,7 @@ fn scan_for_artifacts(
             } else {
                 println!(
                     "  {}",
-                    format!(
-                        "Total: {}",
-                        format_size(total_project_size, BINARY)
-                    )
-                    .green()
+                    format!("Total: {}", format_size(total_project_size, BINARY)).green()
                 );
             }
             println!(); // Add a blank line between projects
@@ -1993,10 +2112,12 @@ fn scan_for_artifacts(
     // Show time filter statistics if active (for all output formats)
     if time_filter.is_active() && !projects.is_empty() {
         println!();
-        println!("Time Filter: {} of {} artifacts passed the filter ({} excluded)",
+        println!(
+            "Time Filter: {} of {} artifacts passed the filter ({} excluded)",
             combined_stats.passed_time_filter,
             combined_stats.total_found,
-            combined_stats.excluded_by_time);
+            combined_stats.excluded_by_time
+        );
     }
 
     Ok(())
