@@ -28,12 +28,14 @@ use clap::Parser;
 use colored::Colorize;
 use humansize::{format_size, BINARY};
 use ignore::WalkBuilder;
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
@@ -838,7 +840,10 @@ fn calculate_total_dir_size(path: &Path) -> u64 {
         for entry in entries.flatten() {
             let entry_path = entry.path();
 
-            if let Ok(metadata) = entry.metadata() {
+            // Use symlink_metadata instead of entry.metadata() to avoid following symlinks
+            // This is equivalent to Python's os.stat(follow_symlinks=False) and prevents
+            // triggering iCloud materialization
+            if let Ok(metadata) = fs::symlink_metadata(&entry_path) {
                 if metadata.is_file() {
                     total += metadata.len();
                 } else if metadata.is_dir() {
@@ -936,7 +941,7 @@ fn handle_directory_artifact(
     start_path: &Path,
     project_root: &Path,
     projects: &mut HashMap<PathBuf, ProjectReport>,
-    skip_paths: &mut HashSet<PathBuf>,
+    skip_paths: &Arc<Mutex<HashSet<PathBuf>>>,
     delete: bool,
     verbose: bool,
     dry_run: bool,
@@ -990,7 +995,7 @@ fn handle_directory_artifact(
             if verbose {
                 println!("  Contains tracked files, skipping");
             }
-            skip_paths.insert(path.to_path_buf());
+            skip_paths.lock().unwrap().insert(path.to_path_buf());
             return Ok(0);
         }
 
@@ -1039,7 +1044,7 @@ fn handle_directory_artifact(
             time_filtered: !passes_time_filter,
         });
 
-        skip_paths.insert(path.to_path_buf());
+        skip_paths.lock().unwrap().insert(path.to_path_buf());
         return Ok(total_bytes);
     }
 
@@ -1071,7 +1076,8 @@ fn handle_directory_artifact(
 
         // Check if file is tracked (O(1) lookup in HashSet)
         if !tracked_files.contains(file_path) {
-            if let Ok(meta) = entry.metadata() {
+            // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
+            if let Ok(meta) = fs::symlink_metadata(file_path) {
                 let file_size = meta.len();
                 dir_total_size += file_size;
                 files_to_remove.push((file_path.to_path_buf(), file_size));
@@ -1130,7 +1136,7 @@ fn handle_directory_artifact(
         });
     }
 
-    skip_paths.insert(path.to_path_buf());
+    skip_paths.lock().unwrap().insert(path.to_path_buf());
     Ok(total_bytes)
 }
 
@@ -1245,7 +1251,7 @@ fn scan_single_path(
     time_filter: &TimeFilter,
 ) -> Result<ScanResult> {
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
-    let mut skip_paths: HashSet<PathBuf> = HashSet::new();
+    let skip_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
     let mut total_bytes: u64 = 0;
     let mut _total_files: u64 = 0;
     let mut stats = TimeFilterStats::default();
@@ -1261,9 +1267,59 @@ fn scan_single_path(
         }
     }
 
+    // Create progress bar
+    let progress = Arc::new(ProgressBar::new_spinner());
+    progress.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .unwrap()
+    );
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let entries_checked = Arc::new(Mutex::new(0u64));
+    let entries_checked_clone = Arc::clone(&entries_checked);
+    let progress_clone = Arc::clone(&progress);
+    let skip_paths_clone = Arc::clone(&skip_paths);
+    let exclude_clone = exclude.to_vec();
+    let start_path_clone = start_path.clone();
+
     let walker = WalkBuilder::new(&start_path)
         .hidden(false) // Include hidden files/dirs by default
         .git_ignore(true)
+        .filter_entry(move |entry| {
+            let path = entry.path();
+
+            // Update progress counter
+            {
+                let mut count = entries_checked_clone.lock().unwrap();
+                *count += 1;
+                if *count % 100 == 0 {
+                    progress_clone.set_message(format!("Scanned {} entries | Current: {}", count, path.display()));
+                }
+            }
+
+            // Never traverse into VCS internal directories
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if VCS_INTERNALS.contains(&name) {
+                    return false;
+                }
+            }
+
+            // Skip user-excluded directories
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                if should_exclude_path(path, &exclude_clone) {
+                    return false;
+                }
+
+                // Skip if inside a previously identified skip_path
+                let skip_paths_set = skip_paths_clone.lock().unwrap();
+                if path != start_path_clone && skip_paths_set.iter().any(|skip| path.starts_with(skip)) {
+                    return false;
+                }
+            }
+
+            true
+        })
         .build();
 
     for result in walker {
@@ -1282,31 +1338,15 @@ fn scan_single_path(
             continue;
         }
 
-        // Skip VCS directories (version control internals)
-        if path.components().any(|c| {
-            if let std::path::Component::Normal(name) = c {
-                VCS_INTERNALS.contains(&name.to_str().unwrap_or(""))
-            } else {
-                false
-            }
-        }) {
-            continue;
-        }
-
-        // Skip excluded directories (user-specified)
-        // Check this early to avoid processing excluded directories as artifacts
-        if entry.file_type().map_or(false, |ft| ft.is_dir()) && should_exclude_path(path, exclude) {
-            if verbose {
-                println!("DEBUG: Skipping excluded directory: {}", path.display());
-            }
-            // Add to skip_paths to prevent traversing into subdirectories
-            skip_paths.insert(path.to_path_buf());
-            continue;
-        }
+        // Note: VCS directories and excluded directories are now filtered by filter_entry
+        // in the walker, so we don't need to check them here again.
 
         // Skip if this path is inside an artifact directory we've already processed
-        if skip_paths.iter().any(|skip| path.starts_with(skip)) {
-            continue;
+        {
+            let skip_paths_set = skip_paths.lock().unwrap();
+            if skip_paths_set.iter().any(|skip| path.starts_with(skip)) {
+                continue;
+            }
         }
 
         // Try to find project root, but constrain it to be within the scan directory
@@ -1360,7 +1400,7 @@ fn scan_single_path(
                     &start_path,
                     &project_root,
                     &mut projects,
-                    &mut skip_paths,
+                    &skip_paths,
                     delete,
                     verbose,
                     dry_run,
@@ -1387,6 +1427,9 @@ fn scan_single_path(
             }
         }
     }
+
+    // Finish progress bar
+    progress.finish_with_message(format!("Scan complete! Checked {} entries", entries_checked.lock().unwrap()));
 
     Ok(ScanResult {
         projects,
@@ -1633,49 +1676,42 @@ fn scan_for_artifacts(
         // Fixed widths for size columns
         let removable_width = 12;
         let too_recent_width = if time_filter.is_active() { 12 } else { 0 };
-        let total_width = 12;
 
-        // Calculate What column width
-        let separator_width = if time_filter.is_active() { 8 } else { 6 }; // spaces between columns
+        // Calculate What column width (removed total_width to improve performance)
+        let separator_width = if time_filter.is_active() { 6 } else { 4 }; // spaces between columns
         let what_width = terminal_width
             .saturating_sub(max_path_width)
             .saturating_sub(removable_width)
             .saturating_sub(too_recent_width)
-            .saturating_sub(total_width)
             .saturating_sub(separator_width)
             .max(20);
 
-        // Print header
+        // Print header (removed "Total" column for performance)
         if time_filter.is_active() {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}",
+                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
                 "Path",
                 "Removable",
                 "Too Recent",
-                "Total",
                 "What",
                 path_w = max_path_width,
                 rem_w = removable_width,
-                rec_w = too_recent_width,
-                tot_w = total_width
+                rec_w = too_recent_width
             );
         } else {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+                "{:<path_w$}  {:>rem_w$}  {}",
                 "Path",
                 "Removable",
-                "Total",
                 "What",
                 path_w = max_path_width,
-                rem_w = removable_width,
-                tot_w = total_width
+                rem_w = removable_width
             );
         }
         println!("{}", "─".repeat(terminal_width.min(120)));
 
         let mut total_removable: u64 = 0;
         let mut total_too_recent: u64 = 0;
-        let mut total_size: u64 = 0;
 
         // Print each project
         for (project_dir, report) in &sorted_projects {
@@ -1692,19 +1728,11 @@ fn scan_for_artifacts(
                 .map(|a| a.size)
                 .sum();
 
-            // Check if this is the root directory
-            let is_root = *project_dir == start_path;
-
-            // Calculate full size (skip for root to avoid long scan, we'll calculate deferred)
-            let full_size = if is_root {
-                0 // Will be calculated after loop
-            } else {
-                calculate_total_dir_size(project_dir)
-            };
+            // Skip calculating full project size to improve performance
+            // (User request: only show artifact sizes, not total project sizes)
 
             total_removable += removable_size;
             total_too_recent += too_recent_size;
-            total_size += full_size;
 
             let relative_path = project_dir
                 .strip_prefix(&start_path)
@@ -1785,7 +1813,8 @@ fn scan_for_artifacts(
                 format_size(removable_size, BINARY).normal()
             };
 
-            let path_styled = if full_size > 500 * 1024 * 1024 {
+            // Style path based on removable size instead of full size
+            let path_styled = if removable_size > 100 * 1024 * 1024 {
                 path_display.bold().yellow()
             } else {
                 path_display.normal()
@@ -1793,27 +1822,23 @@ fn scan_for_artifacts(
 
             if time_filter.is_active() {
                 println!(
-                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}",
+                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
                     path_styled,
                     removable_display,
                     format_size(too_recent_size, BINARY),
-                    format_size(full_size, BINARY),
                     what_display,
                     path_w = max_path_width,
                     rem_w = removable_width,
-                    rec_w = too_recent_width,
-                    tot_w = total_width
+                    rec_w = too_recent_width
                 );
             } else {
                 println!(
-                    "{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}",
+                    "{:<path_w$}  {:>rem_w$}  {}",
                     path_styled,
                     removable_display,
-                    format_size(full_size, BINARY),
                     what_display,
                     path_w = max_path_width,
-                    rem_w = removable_width,
-                    tot_w = total_width
+                    rem_w = removable_width
                 );
             }
 
@@ -1846,22 +1871,20 @@ fn scan_for_artifacts(
                             0
                         };
                         println!(
-                            "{}{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}  {}{}",
+                            "{}{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}{}",
                             indent,
                             "",
                             format_size(file_removable, BINARY),
                             format_size(file_too_recent, BINARY),
-                            format_size(artifact.size, BINARY),
                             file_path_str,
                             filtered_marker,
                             path_w = max_path_width.saturating_sub(indent.len()),
                             rem_w = removable_width,
-                            rec_w = too_recent_width,
-                            tot_w = total_width
+                            rec_w = too_recent_width
                         );
                     } else {
                         println!(
-                            "{}{:<path_w$}  {:>rem_w$}  {:>tot_w$}  {}{}",
+                            "{}{:<path_w$}  {:>rem_w$}  {}{}",
                             indent,
                             "",
                             if artifact.time_filtered {
@@ -1869,45 +1892,34 @@ fn scan_for_artifacts(
                             } else {
                                 format_size(artifact.size, BINARY)
                             },
-                            format_size(artifact.size, BINARY),
                             file_path_str,
                             filtered_marker,
                             path_w = max_path_width.saturating_sub(indent.len()),
-                            rem_w = removable_width,
-                            tot_w = total_width
+                            rem_w = removable_width
                         );
                     }
                 }
             }
         }
 
-        // Calculate deferred total size for root directory if it was scanned
-        if sorted_projects.iter().any(|(p, _)| *p == start_path) {
-            total_size += calculate_total_dir_size(&start_path);
-        }
-
         println!("{}", "─".repeat(terminal_width.min(120)));
         if time_filter.is_active() {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>tot_w$}",
+                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}",
                 "Total",
                 format_size(total_removable, BINARY),
                 format_size(total_too_recent, BINARY),
-                format_size(total_size, BINARY),
                 path_w = max_path_width,
                 rem_w = removable_width,
-                rec_w = too_recent_width,
-                tot_w = total_width
+                rec_w = too_recent_width
             );
         } else {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>tot_w$}",
+                "{:<path_w$}  {:>rem_w$}",
                 "Total",
                 format_size(total_removable, BINARY),
-                format_size(total_size, BINARY),
                 path_w = max_path_width,
-                rem_w = removable_width,
-                tot_w = total_width
+                rem_w = removable_width
             );
         }
 
