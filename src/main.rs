@@ -26,6 +26,7 @@ use anyhow::{Context, Result};
 use chrono::{Datelike, NaiveDate};
 use clap::Parser;
 use colored::Colorize;
+use crossbeam_channel::{bounded, Sender};
 use humansize::{format_size, BINARY};
 use ignore::WalkBuilder;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -36,6 +37,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
+    thread,
     time::{Duration, SystemTime},
 };
 
@@ -88,6 +90,10 @@ struct Args {
     /// Only remove files modified before a specific date (YYYY-MM-DD)
     #[arg(long, value_name = "DATE")]
     modified_before: Option<String>,
+
+    /// Calculate sizes of artifacts (slower, requires traversing directories)
+    #[arg(long)]
+    calculate_sizes: bool,
 }
 
 /// Time filter configuration
@@ -948,6 +954,7 @@ fn handle_directory_artifact(
     list: bool,
     time_filter: &TimeFilter,
     stats: &mut TimeFilterStats,
+    calculate_sizes: bool,
 ) -> Result<u64> {
     let mut total_bytes = 0u64;
 
@@ -1000,7 +1007,12 @@ fn handle_directory_artifact(
         }
 
         // No tracked files → entire directory can be removed
-        let dir_size = calculate_total_dir_size(path);
+        // Skip size calculation unless explicitly requested
+        let dir_size = if calculate_sizes {
+            calculate_total_dir_size(path)
+        } else {
+            0 // Size not calculated
+        };
 
         // Only count towards total if it passes time filter
         if passes_time_filter {
@@ -1076,12 +1088,19 @@ fn handle_directory_artifact(
 
         // Check if file is tracked (O(1) lookup in HashSet)
         if !tracked_files.contains(file_path) {
-            // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
-            if let Ok(meta) = fs::symlink_metadata(file_path) {
-                let file_size = meta.len();
-                dir_total_size += file_size;
-                files_to_remove.push((file_path.to_path_buf(), file_size));
-            }
+            let file_size = if calculate_sizes {
+                // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
+                if let Ok(meta) = fs::symlink_metadata(file_path) {
+                    let size = meta.len();
+                    dir_total_size += size;
+                    size
+                } else {
+                    0
+                }
+            } else {
+                0 // Size not calculated
+            };
+            files_to_remove.push((file_path.to_path_buf(), file_size));
         }
     }
 
@@ -1239,66 +1258,52 @@ fn handle_file_artifact(
     Ok(if passes_time_filter { size } else { 0 })
 }
 
-/// Scan a single path for artifacts (used for parallel processing)
-fn scan_single_path(
-    start_path_str: &str,
-    patterns: &[ArtifactPattern],
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
+/// Discover project directories and send them to a channel for parallel processing.
+/// This function walks the directory tree and identifies project roots. Once a project root
+/// is found, it sends it to the channel and doesn't descend into that project's subdirectories.
+fn discover_projects_streaming(
+    start_path: &Path,
+    _patterns: &[ArtifactPattern],
     exclude: &[String],
-    time_filter: &TimeFilter,
-) -> Result<ScanResult> {
-    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
-    let skip_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
-    let mut total_bytes: u64 = 0;
-    let mut _total_files: u64 = 0;
-    let mut stats = TimeFilterStats::default();
-
-    let start_path = PathBuf::from(start_path_str);
-    if verbose {
-        println!("DEBUG: Scanning directory {}", start_path.display());
-        println!("DEBUG: Directory contents:");
-        if let Ok(entries) = fs::read_dir(&start_path) {
-            for entry in entries.flatten() {
-                println!("  > {}", entry.path().display());
-            }
-        }
+    sender: Sender<PathBuf>,
+    progress: Arc<ProgressBar>,
+) -> Result<()> {
+    // Special case: if start_path itself is a project root, just send it
+    if is_project_root(start_path) {
+        sender.send(start_path.to_path_buf()).ok();
+        progress.set_message("Discovery complete: found 1 project".to_string());
+        return Ok(());
     }
 
-    // Create progress bar
-    let progress = Arc::new(ProgressBar::new_spinner());
-    progress.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] {msg}")
-            .unwrap()
-    );
-    progress.enable_steady_tick(std::time::Duration::from_millis(100));
-
-    let entries_checked = Arc::new(Mutex::new(0u64));
-    let entries_checked_clone = Arc::clone(&entries_checked);
+    let discovered_count = Arc::new(Mutex::new(0u64));
+    let discovered_count_clone = Arc::clone(&discovered_count);
+    let discovered_projects = Arc::new(Mutex::new(HashSet::new()));
+    let discovered_projects_clone = Arc::clone(&discovered_projects);
+    let entries_scanned = Arc::new(Mutex::new(0u64));
+    let entries_scanned_clone = Arc::clone(&entries_scanned);
     let progress_clone = Arc::clone(&progress);
-    let skip_paths_clone = Arc::clone(&skip_paths);
     let exclude_clone = exclude.to_vec();
-    let start_path_clone = start_path.clone();
+    let start_path_buf = start_path.to_path_buf();
 
-    let walker = WalkBuilder::new(&start_path)
-        .hidden(false) // Include hidden files/dirs by default
-        .git_ignore(true)
+    let walker = WalkBuilder::new(start_path)
+        .hidden(false)
+        .git_ignore(false)  // Disable .gitignore
+        .ignore(false)       // Disable .ignore files
+        .git_global(false)   // Disable global git ignore
+        .git_exclude(false)  // Disable .git/info/exclude
         .filter_entry(move |entry| {
             let path = entry.path();
 
-            // Update progress counter
+            // Update progress
             {
-                let mut count = entries_checked_clone.lock().unwrap();
+                let mut count = entries_scanned_clone.lock().unwrap();
                 *count += 1;
                 if *count % 100 == 0 {
-                    progress_clone.set_message(format!("Scanned {} entries | Current: {}", count, path.display()));
+                    progress_clone.set_message(format!("Discovering projects: {} entries scanned", count));
                 }
             }
 
-            // Never traverse into VCS internal directories
+            // Never traverse VCS internals
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if VCS_INTERNALS.contains(&name) {
                     return false;
@@ -1311,9 +1316,95 @@ fn scan_single_path(
                     return false;
                 }
 
-                // Skip if inside a previously identified skip_path
-                let skip_paths_set = skip_paths_clone.lock().unwrap();
-                if path != start_path_clone && skip_paths_set.iter().any(|skip| path.starts_with(skip)) {
+                // Don't descend into subdirectories of discovered project roots
+                if path != start_path_buf {
+                    let projects = discovered_projects_clone.lock().unwrap();
+                    if projects.iter().any(|proj: &PathBuf| path.starts_with(proj)) {
+                        return false;
+                    }
+                }
+
+                // Check if this directory IS a project root
+                if is_project_root(path) {
+                    // Mark it as discovered to prevent descending into subdirectories
+                    discovered_projects_clone.lock().unwrap().insert(path.to_path_buf());
+                    *discovered_count_clone.lock().unwrap() += 1;
+                    // Note: We still return true to allow the walker to yield this entry
+                    // so we can send it in the main loop
+                }
+            }
+
+            true
+        })
+        .build();
+
+    for result in walker {
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(err) => {
+                eprintln!("Warning: Failed to access entry during discovery: {}", err);
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        // Check if this was marked as a project root (already added to discovered_projects in filter_entry)
+        if discovered_projects.lock().unwrap().contains(path) {
+            if sender.send(path.to_path_buf()).is_err() {
+                // Receiver dropped, stop discovering
+                break;
+            }
+        }
+    }
+
+    let count = discovered_count.lock().unwrap();
+    progress.set_message(format!("Discovery complete: found {} projects", *count));
+    Ok(())
+}
+
+/// Scan a single project for artifacts.
+/// This is extracted from scan_single_path to allow parallel processing at the project level.
+fn scan_project_for_artifacts(
+    project_root: PathBuf,
+    patterns: &[ArtifactPattern],
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+    exclude: &[String],
+    time_filter: &TimeFilter,
+    calculate_sizes: bool,
+) -> Result<ScanResult> {
+    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
+    let skip_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
+    let mut total_bytes: u64 = 0;
+    let mut stats = TimeFilterStats::default();
+
+    // Canonicalize the project root
+    let project_root = project_root.canonicalize().unwrap_or(project_root);
+
+    let exclude_clone = exclude.to_vec();
+
+    let walker = WalkBuilder::new(&project_root)
+        .hidden(false)
+        .git_ignore(false)  // Disable .gitignore
+        .ignore(false)       // Disable .ignore files
+        .git_global(false)   // Disable global git ignore
+        .git_exclude(false)  // Disable .git/info/exclude
+        .filter_entry(move |entry| {
+            let path = entry.path();
+
+            // Never traverse VCS internals
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if VCS_INTERNALS.contains(&name) {
+                    return false;
+                }
+            }
+
+            // Skip user-excluded directories
+            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+                if should_exclude_path(path, &exclude_clone) {
                     return false;
                 }
             }
@@ -1326,20 +1417,17 @@ fn scan_single_path(
         let entry = match result {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("Warning: Failed to access entry: {}", err);
+                eprintln!("Warning: Failed to access entry in {}: {}", project_root.display(), err);
                 continue;
             }
         };
 
         let path = entry.path();
 
-        // Never process the scan root itself as an artifact
-        if path == start_path.as_path() {
+        // Never process the project root itself as an artifact
+        if path == project_root.as_path() {
             continue;
         }
-
-        // Note: VCS directories and excluded directories are now filtered by filter_entry
-        // in the walker, so we don't need to check them here again.
 
         // Skip if this path is inside an artifact directory we've already processed
         {
@@ -1349,43 +1437,17 @@ fn scan_single_path(
             }
         }
 
-        // Try to find project root, but constrain it to be within the scan directory
-        // Canonicalize to ensure consistent path format for HashMap keys and strip_prefix
-        let project_root = find_project_root(path)
-            .and_then(|root| {
-                if root.starts_with(&start_path) {
-                    Some(root)
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| start_path.clone());
-
-        // Canonicalize the project root to match the format of start_path
-        // This ensures strip_prefix() works correctly in display code
-        let project_root = project_root.canonicalize().unwrap_or(project_root);
-
-        // Add debugging to see each path we check
-        if verbose {
-            println!("DEBUG: Checking path: {}", path.display());
-        }
-
         // Check if the path is an artifact
         if is_artifact(path, patterns) {
-            // Use symlink_metadata to avoid following symlinks
             let metadata = match fs::symlink_metadata(path) {
                 Ok(meta) => meta,
                 Err(err) => {
-                    eprintln!(
-                        "Warning: Could not get metadata for {}: {}",
-                        path.display(),
-                        err
-                    );
+                    eprintln!("Warning: Could not get metadata for {}: {}", path.display(), err);
                     continue;
                 }
             };
 
-            // Skip symlinks entirely
+            // Skip symlinks
             if metadata.is_symlink() {
                 if verbose {
                     println!("Skipping symlink: {}", path.display());
@@ -1397,7 +1459,7 @@ fn scan_single_path(
             if metadata.is_dir() {
                 let bytes = handle_directory_artifact(
                     path,
-                    &start_path,
+                    &project_root,
                     &project_root,
                     &mut projects,
                     &skip_paths,
@@ -1407,6 +1469,7 @@ fn scan_single_path(
                     list,
                     time_filter,
                     &mut stats,
+                    calculate_sizes,
                 )?;
                 total_bytes += bytes;
             } else {
@@ -1423,13 +1486,112 @@ fn scan_single_path(
                     &mut stats,
                 )?;
                 total_bytes += bytes;
-                _total_files += 1;
             }
         }
     }
 
+    Ok(ScanResult {
+        projects,
+        total_bytes,
+        stats,
+    })
+}
+
+/// Scan a single path for artifacts using streaming producer-consumer architecture.
+/// This parallelizes at the repository level for much better performance when scanning
+/// directories containing many projects.
+fn scan_single_path(
+    start_path_str: &str,
+    patterns: &[ArtifactPattern],
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+    exclude: &[String],
+    time_filter: &TimeFilter,
+    calculate_sizes: bool,
+) -> Result<ScanResult> {
+    let start_path = PathBuf::from(start_path_str);
+
+    if verbose {
+        println!("DEBUG: Scanning directory {}", start_path.display());
+    }
+
+    // Create progress bar
+    let progress = Arc::new(ProgressBar::new_spinner());
+    progress.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} [{elapsed_precise}] {msg}")
+            .unwrap()
+    );
+    progress.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    // Create bounded channel for streaming project roots
+    let (sender, receiver) = bounded::<PathBuf>(100);
+
+    // Clone data for producer thread
+    let patterns_clone = patterns.to_vec();
+    let exclude_clone = exclude.to_vec();
+    let start_path_clone = start_path.clone();
+    let progress_clone = Arc::clone(&progress);
+
+    // Spawn producer thread to discover projects
+    let producer_handle = thread::spawn(move || {
+        discover_projects_streaming(
+            &start_path_clone,
+            &patterns_clone,
+            &exclude_clone,
+            sender,
+            progress_clone,
+        )
+    });
+
+    // Process discovered projects in parallel using rayon
+    let results: Vec<ScanResult> = receiver
+        .into_iter()
+        .par_bridge()
+        .map(|project_root| {
+            scan_project_for_artifacts(
+                project_root,
+                patterns,
+                delete,
+                verbose,
+                dry_run,
+                list,
+                exclude,
+                time_filter,
+                calculate_sizes,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Wait for producer to finish
+    producer_handle.join().map_err(|_| anyhow::anyhow!("Producer thread panicked"))??;
+
+    // Merge results from parallel processing
+    let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
+    let mut total_bytes: u64 = 0;
+    let mut stats = TimeFilterStats::default();
+
+    for result in results {
+        total_bytes += result.total_bytes;
+        stats.total_found += result.stats.total_found;
+        stats.passed_time_filter += result.stats.passed_time_filter;
+        stats.excluded_by_time += result.stats.excluded_by_time;
+
+        for (project_path, project_report) in result.projects {
+            projects
+                .entry(project_path)
+                .or_insert_with(|| ProjectReport {
+                    artifacts: Vec::new(),
+                })
+                .artifacts
+                .extend(project_report.artifacts);
+        }
+    }
+
     // Finish progress bar
-    progress.finish_with_message(format!("Scan complete! Checked {} entries", entries_checked.lock().unwrap()));
+    progress.finish_with_message("Scan complete!");
 
     Ok(ScanResult {
         projects,
@@ -1449,6 +1611,7 @@ fn scan_for_artifacts(
     exclude: Vec<String>,
     older_than: Option<String>,
     modified_before: Option<String>,
+    calculate_sizes: bool,
 ) -> Result<()> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
@@ -1494,6 +1657,7 @@ fn scan_for_artifacts(
                 list,
                 &exclude,
                 &time_filter,
+                calculate_sizes,
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1646,11 +1810,28 @@ fn scan_for_artifacts(
         let mut sorted_projects: Vec<_> = projects
             .iter()
             .filter(|(_, report)| {
-                let total: u64 = report.artifacts.iter().map(|a| a.size).sum();
-                total > 0
+                // If calculating sizes, filter by size. Otherwise, just check if there are artifacts.
+                if calculate_sizes {
+                    let total: u64 = report.artifacts.iter().map(|a| a.size).sum();
+                    total > 0
+                } else {
+                    !report.artifacts.is_empty()
+                }
             })
             .collect();
         sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
+
+        // If no projects to display, show a special message
+        if sorted_projects.is_empty() {
+            println!("\nNo artifacts found.");
+            return Ok(());
+        }
+
+        // Count total artifacts across all projects
+        let total_artifact_count: usize = sorted_projects
+            .iter()
+            .map(|(_, report)| report.artifacts.len())
+            .sum();
 
         // Get terminal width (default to 120 if not available)
         let terminal_width = if let Some((Width(w), _)) = terminal_size() {
@@ -1673,12 +1854,16 @@ fn scan_for_artifacts(
             .unwrap_or(20)
             .min(40); // Cap path width at 40 chars
 
-        // Fixed widths for size columns
-        let removable_width = 12;
-        let too_recent_width = if time_filter.is_active() { 12 } else { 0 };
+        // Fixed widths for size columns (only if calculate_sizes is enabled)
+        let removable_width = if calculate_sizes { 12 } else { 0 };
+        let too_recent_width = if calculate_sizes && time_filter.is_active() { 12 } else { 0 };
 
-        // Calculate What column width (removed total_width to improve performance)
-        let separator_width = if time_filter.is_active() { 6 } else { 4 }; // spaces between columns
+        // Calculate What column width
+        let separator_width = if calculate_sizes {
+            if time_filter.is_active() { 6 } else { 4 }
+        } else {
+            2  // Just "Path  What"
+        };
         let what_width = terminal_width
             .saturating_sub(max_path_width)
             .saturating_sub(removable_width)
@@ -1686,8 +1871,16 @@ fn scan_for_artifacts(
             .saturating_sub(separator_width)
             .max(20);
 
-        // Print header (removed "Total" column for performance)
-        if time_filter.is_active() {
+        // Print header - hide size columns when not calculated
+        if !calculate_sizes {
+            // No size columns
+            println!(
+                "{:<path_w$}  {}",
+                "Path",
+                "What",
+                path_w = max_path_width
+            );
+        } else if time_filter.is_active() {
             println!(
                 "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
                 "Path",
@@ -1806,40 +1999,51 @@ fn scan_for_artifacts(
 
             let what_display = what_parts.join(", ");
 
-            // Apply styling based on thresholds
-            let removable_display = if removable_size > 100 * 1024 * 1024 {
-                format_size(removable_size, BINARY).bold().red()
-            } else {
-                format_size(removable_size, BINARY).normal()
-            };
-
-            // Style path based on removable size instead of full size
-            let path_styled = if removable_size > 100 * 1024 * 1024 {
-                path_display.bold().yellow()
-            } else {
-                path_display.normal()
-            };
-
-            if time_filter.is_active() {
+            // Print row based on whether sizes are calculated
+            if !calculate_sizes {
+                // No size columns - just path and what
                 println!(
-                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
-                    path_styled,
-                    removable_display,
-                    format_size(too_recent_size, BINARY),
+                    "{:<path_w$}  {}",
+                    path_display,
                     what_display,
-                    path_w = max_path_width,
-                    rem_w = removable_width,
-                    rec_w = too_recent_width
+                    path_w = max_path_width
                 );
             } else {
-                println!(
-                    "{:<path_w$}  {:>rem_w$}  {}",
-                    path_styled,
-                    removable_display,
-                    what_display,
-                    path_w = max_path_width,
-                    rem_w = removable_width
-                );
+                // Apply styling based on thresholds
+                let removable_display = if removable_size > 100 * 1024 * 1024 {
+                    format_size(removable_size, BINARY).bold().red()
+                } else {
+                    format_size(removable_size, BINARY).normal()
+                };
+
+                // Style path based on removable size
+                let path_styled = if removable_size > 100 * 1024 * 1024 {
+                    path_display.bold().yellow()
+                } else {
+                    path_display.normal()
+                };
+
+                if time_filter.is_active() {
+                    println!(
+                        "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
+                        path_styled,
+                        removable_display,
+                        format_size(too_recent_size, BINARY),
+                        what_display,
+                        path_w = max_path_width,
+                        rem_w = removable_width,
+                        rec_w = too_recent_width
+                    );
+                } else {
+                    println!(
+                        "{:<path_w$}  {:>rem_w$}  {}",
+                        path_styled,
+                        removable_display,
+                        what_display,
+                        path_w = max_path_width,
+                        rem_w = removable_width
+                    );
+                }
             }
 
             // Show individual files if --files flag is set
@@ -1903,7 +2107,16 @@ fn scan_for_artifacts(
         }
 
         println!("{}", "─".repeat(terminal_width.min(120)));
-        if time_filter.is_active() {
+
+        // Print total row
+        if !calculate_sizes {
+            // Show count of projects and artifacts instead of sizes
+            println!(
+                "\nFound {} artifact(s) across {} project(s). Use --calculate-sizes to see sizes.",
+                total_artifact_count,
+                sorted_projects.len()
+            );
+        } else if time_filter.is_active() {
             println!(
                 "{:<path_w$}  {:>rem_w$}  {:>rec_w$}",
                 "Total",
@@ -2149,6 +2362,7 @@ fn main() -> Result<()> {
         args.exclude,
         args.older_than,
         args.modified_before,
+        args.calculate_sizes,
     )?;
 
     Ok(())
