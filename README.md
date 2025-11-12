@@ -62,7 +62,7 @@ This ensures that `/build` patterns only match at the actual project root, not i
 
 - **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
 - **VCS Directory Skip**: Never scans inside version control directories (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
-- **Respects `.gitignore`**: Uses gitignore patterns to skip files
+- **Traversal Optimization**: Uses `.gitignore` patterns to skip directories during scanning (but removal decisions are based on VCS tracking status, not gitignore)
 - **Symlink Safe**: Never follows or deletes symlinks
 - **Dry Run Mode**: Use `--dry-run` to see what would be deleted without actually deleting
 
@@ -113,7 +113,6 @@ cleanslate --delete
 - `[PATHS]...`: Directories to scan (defaults to current directory)
 - `-d, --delete`: Delete the found artifacts
 - `-v, --verbose`: Show detailed information about found artifacts
-- `-f, --files`: Show individual files instead of summary per directory
 - `--dry-run`: Show what would be deleted without actually deleting (implies --delete)
 - `-l, --list`: Show detailed list format instead of table (table is default)
 - `-h, --help`: Print help

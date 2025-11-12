@@ -61,10 +61,6 @@ struct Args {
     #[arg(long, short)]
     verbose: bool,
 
-    /// Show individual files instead of summary per directory
-    #[arg(long, short)]
-    files: bool,
-
     /// Show what would be deleted without actually deleting (implies --delete)
     #[arg(long)]
     dry_run: bool,
@@ -1088,28 +1084,44 @@ fn handle_directory_artifact(
 
         // Check if file is tracked (O(1) lookup in HashSet)
         if !tracked_files.contains(file_path) {
-            let file_size = if calculate_sizes {
-                // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
+            // Category 3: Check each file's mtime individually
+            let file_passes_time_filter = if time_filter.is_active() {
                 if let Ok(meta) = fs::symlink_metadata(file_path) {
-                    let size = meta.len();
-                    dir_total_size += size;
-                    size
+                    if let Ok(mtime) = meta.modified() {
+                        time_filter.passes(mtime)
+                    } else {
+                        true // If we can't get mtime, assume it passes
+                    }
                 } else {
-                    0
+                    true // If we can't get metadata, assume it passes
                 }
             } else {
-                0 // Size not calculated
+                true // No time filter active
             };
-            files_to_remove.push((file_path.to_path_buf(), file_size));
+
+            // Only add to removal list if it passes time filter
+            if file_passes_time_filter {
+                let file_size = if calculate_sizes {
+                    // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
+                    if let Ok(meta) = fs::symlink_metadata(file_path) {
+                        let size = meta.len();
+                        dir_total_size += size;
+                        size
+                    } else {
+                        0
+                    }
+                } else {
+                    0 // Size not calculated
+                };
+                files_to_remove.push((file_path.to_path_buf(), file_size));
+            }
         }
     }
 
     // Only report and remove if there are untracked files
     if !files_to_remove.is_empty() {
-        // Only count towards total if it passes time filter
-        if passes_time_filter {
-            total_bytes += dir_total_size;
-        }
+        // For Category 3: files are already filtered by mtime, so add size unconditionally
+        total_bytes += dir_total_size;
 
         let project_report = projects
             .entry(project_root.to_path_buf())
@@ -1117,8 +1129,8 @@ fn handle_directory_artifact(
                 artifacts: Vec::new(),
             });
 
-        // Remove files if in delete mode AND passes time filter
-        let should_remove = passes_time_filter && (delete || dry_run);
+        // Remove files if in delete mode (files already passed time filter check)
+        let should_remove = delete || dry_run;
         if should_remove && delete && !dry_run {
             for (file_path, _) in &files_to_remove {
                 match fs::remove_file(file_path) {
@@ -1146,12 +1158,13 @@ fn handle_directory_artifact(
             .ok()
             .and_then(|m| m.modified().ok());
 
+        // Category 3: Files already filtered, so time_filtered is always false for reported artifacts
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_total_size,
             removed: should_remove,
             modified: dir_modified,
-            time_filtered: !passes_time_filter,
+            time_filtered: false, // Files already passed time filter check
         });
     }
 
@@ -1287,10 +1300,10 @@ fn discover_projects_streaming(
 
     let walker = WalkBuilder::new(start_path)
         .hidden(false)
-        .git_ignore(false)  // Disable .gitignore
-        .ignore(false)       // Disable .ignore files
-        .git_global(false)   // Disable global git ignore
-        .git_exclude(false)  // Disable .git/info/exclude
+        .git_ignore(true)   // Enable .gitignore for traversal optimization
+        .ignore(true)        // Enable .ignore files
+        .git_global(true)    // Enable global git ignore
+        .git_exclude(true)   // Enable .git/info/exclude
         .filter_entry(move |entry| {
             let path = entry.path();
 
@@ -1388,10 +1401,10 @@ fn scan_project_for_artifacts(
 
     let walker = WalkBuilder::new(&project_root)
         .hidden(false)
-        .git_ignore(false)  // Disable .gitignore
-        .ignore(false)       // Disable .ignore files
-        .git_global(false)   // Disable global git ignore
-        .git_exclude(false)  // Disable .git/info/exclude
+        .git_ignore(true)   // Enable .gitignore for traversal optimization
+        .ignore(true)        // Enable .ignore files
+        .git_global(true)    // Enable global git ignore
+        .git_exclude(true)   // Enable .git/info/exclude
         .filter_entry(move |entry| {
             let path = entry.path();
 
@@ -1604,7 +1617,6 @@ fn scan_for_artifacts(
     paths: &[String],
     delete: bool,
     verbose: bool,
-    files: bool,
     dry_run: bool,
     list: bool,
     aggressive: bool,
@@ -2046,64 +2058,6 @@ fn scan_for_artifacts(
                 }
             }
 
-            // Show individual files if --files flag is set
-            if files {
-                for artifact in &report.artifacts {
-                    let file_path_str = artifact
-                        .path
-                        .strip_prefix(&start_path)
-                        .unwrap_or(&artifact.path)
-                        .display()
-                        .to_string();
-
-                    let indent = "  ├─ ";
-                    let filtered_marker = if artifact.time_filtered {
-                        " [too recent]"
-                    } else {
-                        ""
-                    };
-
-                    if time_filter.is_active() {
-                        let file_removable = if artifact.time_filtered {
-                            0
-                        } else {
-                            artifact.size
-                        };
-                        let file_too_recent = if artifact.time_filtered {
-                            artifact.size
-                        } else {
-                            0
-                        };
-                        println!(
-                            "{}{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}{}",
-                            indent,
-                            "",
-                            format_size(file_removable, BINARY),
-                            format_size(file_too_recent, BINARY),
-                            file_path_str,
-                            filtered_marker,
-                            path_w = max_path_width.saturating_sub(indent.len()),
-                            rem_w = removable_width,
-                            rec_w = too_recent_width
-                        );
-                    } else {
-                        println!(
-                            "{}{:<path_w$}  {:>rem_w$}  {}{}",
-                            indent,
-                            "",
-                            if artifact.time_filtered {
-                                format!("{:>w$}", "", w = removable_width)
-                            } else {
-                                format_size(artifact.size, BINARY)
-                            },
-                            file_path_str,
-                            filtered_marker,
-                            path_w = max_path_width.saturating_sub(indent.len()),
-                            rem_w = removable_width
-                        );
-                    }
-                }
-            }
         }
 
         println!("{}", "─".repeat(terminal_width.min(120)));
@@ -2221,59 +2175,45 @@ fn scan_for_artifacts(
 
             println!("{}", path_display.bold());
 
-            if files {
-                for artifact in &report.artifacts {
-                    let rel_artifact = artifact
-                        .path
-                        .strip_prefix(&start_path)
-                        .unwrap_or(&artifact.path);
-                    println!(
-                        "  - {} ({})",
-                        rel_artifact.display(),
-                        format_size(artifact.size, BINARY)
-                    );
-                }
-            } else {
-                // Aggregate by language and collect artifact names
-                let mut language_summary: HashMap<String, (u64, Vec<String>)> = HashMap::new();
+            // Aggregate by language and collect artifact names
+            let mut language_summary: HashMap<String, (u64, Vec<String>)> = HashMap::new();
 
-                for artifact in &report.artifacts {
-                    let path = &artifact.path;
-                    let path_str = path.to_string_lossy();
-                    let filename = path
-                        .file_name()
-                        .map(|f| f.to_string_lossy())
-                        .unwrap_or_default()
-                        .to_string();
+            for artifact in &report.artifacts {
+                let path = &artifact.path;
+                let path_str = path.to_string_lossy();
+                let filename = path
+                    .file_name()
+                    .map(|f| f.to_string_lossy())
+                    .unwrap_or_default()
+                    .to_string();
 
-                    // Find the matching pattern to get the language
-                    if let Some(matching_pattern) = patterns
-                        .iter()
-                        .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-                    {
-                        let entry = language_summary
-                            .entry(matching_pattern.language_name.clone())
-                            .or_insert((0, Vec::new()));
-                        entry.0 += artifact.size;
-                        if !entry.1.contains(&filename) {
-                            entry.1.push(filename);
-                        }
+                // Find the matching pattern to get the language
+                if let Some(matching_pattern) = patterns
+                    .iter()
+                    .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
+                {
+                    let entry = language_summary
+                        .entry(matching_pattern.language_name.clone())
+                        .or_insert((0, Vec::new()));
+                    entry.0 += artifact.size;
+                    if !entry.1.contains(&filename) {
+                        entry.1.push(filename);
                     }
                 }
+            }
 
-                // Sort languages alphabetically
-                let mut languages: Vec<_> = language_summary.into_iter().collect();
-                languages.sort_by(|a, b| a.0.cmp(&b.0));
+            // Sort languages alphabetically
+            let mut languages: Vec<_> = language_summary.into_iter().collect();
+            languages.sort_by(|a, b| a.0.cmp(&b.0));
 
-                for (language, (size, artifacts)) in languages {
-                    let artifacts_str = artifacts.join(", ");
-                    println!(
-                        "  - {}: {} ({})",
-                        language,
-                        format_size(size, BINARY),
-                        artifacts_str
-                    );
-                }
+            for (language, (size, artifacts)) in languages {
+                let artifacts_str = artifacts.join(", ");
+                println!(
+                    "  - {}: {} ({})",
+                    language,
+                    format_size(size, BINARY),
+                    artifacts_str
+                );
             }
 
             if time_filter.is_active() && too_recent_size > 0 {
@@ -2355,7 +2295,6 @@ fn main() -> Result<()> {
         &args.paths,
         args.delete,
         args.verbose,
-        args.files,
         args.dry_run,
         args.list,
         args.aggressive,

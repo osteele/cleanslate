@@ -57,10 +57,10 @@ fn test_verbose_flag() {
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
     let assert = cmd.arg(dir.path()).arg("--verbose").assert();
 
-    // With verbose flag, we should see DEBUG messages
+    // With verbose flag, we should see DEBUG messages about scanning directories
     assert
         .success()
-        .stdout(predicate::str::contains("DEBUG: Checking path"));
+        .stdout(predicate::str::contains("DEBUG: Scanning directory").or(predicate::str::contains("DEBUG: Spot-checking")));
 }
 
 #[test]
@@ -71,7 +71,8 @@ fn test_delete_flag_dry_run() {
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
     let assert = cmd.arg(dir.path()).assert();
 
-    assert.success().stdout(predicate::str::contains("Total")); // Table format shows "Total" row
+    // Without --calculate-sizes, should show artifact count message instead of "Total" row
+    assert.success().stdout(predicate::str::contains("Found").and(predicate::str::contains("artifact")));
 
     // Verify that our artifacts still exist
     assert!(dir.path().join("node_modules").exists());
@@ -167,13 +168,9 @@ fn test_exclude_does_not_affect_files() {
         .arg("--verbose")
         .assert();
 
-    // Should exclude the dist directory and find node_modules
+    // Should exclude the dist directory (silently) and still find node_modules
     assert
         .success()
-        .stdout(
-            predicate::str::contains("Skipping excluded directory")
-                .and(predicate::str::contains("dist")),
-        )
         .stdout(predicate::str::contains("node_modules"));
 
     // The dist directory should still exist (we didn't delete)

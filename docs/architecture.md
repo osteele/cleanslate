@@ -216,3 +216,82 @@ After removing files, directories may become empty. The cleanup pass:
 **Why this matters:** Removing files from `src/build/output/file.o` should also remove the empty `output/` and `build/` directories if they become empty.
 
 **Code location:** `src/main.rs:~720-795`
+
+## Time-Based Filtering Strategy
+
+CleanSlate supports filtering artifacts by modification time using `--older-than` and `--modified-before` flags. The implementation uses a **hybrid approach** that balances performance with intuitive behavior.
+
+### Hybrid Time Filtering
+
+**Category 2 Directories (Recreatable)**: Uses **directory-level mtime** check
+- Check the directory's modification time once before spot-checking
+- If directory passes time filter → proceed with spot-check and potential removal
+- If directory fails → skip entirely (mark as time_filtered)
+- **Rationale:** These are atomic units treated as a whole. Directory mtime reflects recent activity within.
+- **Performance:** Maintains the 10,000x speedup by avoiding file-level traversal
+
+**Category 3 Directories (Other)**: Uses **per-file mtime** check
+- Each untracked file's mtime is checked individually during traversal
+- Only files that pass the time filter are added to the removal list
+- **Rationale:** These directories mix artifacts with source files; per-file filtering is more intuitive
+- **Performance:** Minor impact since we're already traversing to check VCS status
+
+### Why Hybrid?
+
+The two-tier approach optimizes for different use cases:
+
+1. **Build artifacts** (`target/`, `node_modules/`, `.venv/`): Typically managed as units
+   - "Remove this entire cache if it hasn't been touched in 30 days"
+   - Directory mtime is sufficient and avoids traversal overhead
+
+2. **Mixed directories** (custom build outputs): Need file-level precision
+   - "Remove old .o files but keep recent ones"
+   - Per-file mtime provides the expected behavior
+
+### Implementation Details
+
+**Directory-level check** (Category 2):
+```rust
+// Check once per directory before handling
+let passes_time_filter = if time_filter.is_active() {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if let Ok(mtime) = metadata.modified() {
+            time_filter.passes(mtime)
+        } else { true }
+    } else { true }
+} else { true };
+```
+
+**Per-file check** (Category 3):
+```rust
+// Check each file individually during traversal
+for entry in walkdir::WalkDir::new(path) {
+    let file_passes_time_filter = if time_filter.is_active() {
+        if let Ok(meta) = fs::symlink_metadata(file_path) {
+            if let Ok(mtime) = meta.modified() {
+                time_filter.passes(mtime)
+            } else { true }
+        } else { true }
+    } else { true };
+
+    if file_passes_time_filter {
+        files_to_remove.push(file_path);
+    }
+}
+```
+
+### Directory mtime Semantics
+
+On Unix-like systems, a directory's mtime updates when:
+- Files are added to the directory
+- Files are removed from the directory
+- Files are renamed within the directory
+- Directory metadata (permissions, etc.) changes
+
+The directory mtime does NOT update when:
+- File contents are modified (only the file's mtime changes)
+- Subdirectories' contents change (only subdirectory's mtime changes)
+
+For Category 2 artifacts, this is usually acceptable since installing/updating dependencies (the primary use case) modifies the directory structure.
+
+**Code location:** `src/main.rs:~963-989` (directory-level), `src/main.rs:~1087-1100` (per-file)
