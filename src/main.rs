@@ -1300,10 +1300,15 @@ fn discover_projects_streaming(
 
     let walker = WalkBuilder::new(start_path)
         .hidden(false)
-        .git_ignore(true)   // Enable .gitignore for traversal optimization
-        .ignore(true)        // Enable .ignore files
-        .git_global(true)    // Enable global git ignore
-        .git_exclude(true)   // Enable .git/info/exclude
+        // Disable gitignore processing - it adds significant overhead (parsing hundreds of
+        // .gitignore files) with no benefit since:
+        // 1. We have our own artifact patterns in artifacts.toml
+        // 2. We already skip VCS directories via VCS_INTERNALS
+        // 3. We use VCS commands (git ls-files/jj file list) as source of truth for tracking
+        .git_ignore(false)
+        .ignore(false)
+        .git_global(false)
+        .git_exclude(false)
         .filter_entry(move |entry| {
             let path = entry.path();
 
@@ -1372,7 +1377,7 @@ fn discover_projects_streaming(
     }
 
     let count = discovered_count.lock().unwrap();
-    progress.set_message(format!("Discovery complete: found {} projects", *count));
+    progress.set_message(format!("Discovered {} projects, scanning artifacts...", *count));
     Ok(())
 }
 
@@ -1401,10 +1406,11 @@ fn scan_project_for_artifacts(
 
     let walker = WalkBuilder::new(&project_root)
         .hidden(false)
-        .git_ignore(true)   // Enable .gitignore for traversal optimization
-        .ignore(true)        // Enable .ignore files
-        .git_global(true)    // Enable global git ignore
-        .git_exclude(true)   // Enable .git/info/exclude
+        // Disable gitignore processing - adds overhead with no benefit (see comment in discover_projects_streaming)
+        .git_ignore(false)
+        .ignore(false)
+        .git_global(false)
+        .git_exclude(false)
         .filter_entry(move |entry| {
             let path = entry.path();
 

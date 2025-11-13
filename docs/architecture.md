@@ -143,13 +143,24 @@ If someone committed `node_modules/` before adding it to `.gitignore`, those fil
 → KEEP (Layer 1: doesn't match artifact pattern)
 ```
 
-### The Role of the `ignore` Crate
+### Why Gitignore Processing is Disabled
 
-The `ignore` crate (used via `WalkBuilder`) is **ONLY for traversal optimization**, NOT for removal decisions.
+The `ignore` crate (used via `WalkBuilder`) **is intentionally disabled** (`.git_ignore(false)`) because:
 
-It helps us skip directories during traversal (respects `.gitignore`), but we **must** query VCS tracking status via `git ls-files` or `jj file list` to make removal decisions.
+**Performance overhead with no benefit:**
+- In large codebases with hundreds of `.gitignore` files, the `ignore` crate reads and parses all of them
+- This adds significant I/O and CPU overhead during traversal
+- Example: A directory with 455 `.gitignore` files can cause multi-minute slowdowns
 
-**Why we use it:** If `.gitignore` says to ignore `node_modules`, the `WalkBuilder` won't traverse into it, saving time. But this is just an optimization - the removal decision still requires checking VCS tracking.
+**No actual benefit for CleanSlate:**
+1. **We have our own patterns**: `artifacts.toml` defines what to remove, not `.gitignore`
+2. **VCS directories already skipped**: The `VCS_INTERNALS` constant handles `.git`, `.jj`, etc.
+3. **VCS commands are source of truth**: `git ls-files` / `jj file list` determine tracking status
+
+**The gitignore paradox:** Using `.gitignore` to skip directories doesn't help when:
+- We need to check tracking status anyway (requires VCS command)
+- Our artifact patterns don't align with gitignore patterns
+- The overhead of parsing gitignore files exceeds any traversal savings
 
 ## VCS Checking Strategy
 

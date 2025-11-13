@@ -62,7 +62,7 @@ This ensures that `/build` patterns only match at the actual project root, not i
 
 - **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
 - **VCS Directory Skip**: Never scans inside version control directories (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
-- **Traversal Optimization**: Uses `.gitignore` patterns to skip directories during scanning (but removal decisions are based on VCS tracking status, not gitignore)
+- **Pattern-Based Selection**: Only removes files matching known artifact patterns (from `artifacts.toml`), leaving untracked source files alone
 - **Symlink Safe**: Never follows or deletes symlinks
 - **Dry Run Mode**: Use `--dry-run` to see what would be deleted without actually deleting
 
