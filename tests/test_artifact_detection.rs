@@ -1,8 +1,5 @@
-use crate::main::{get_artifact_patterns, is_artifact};
+use cleanslate::{find_project_root, get_artifact_patterns, is_artifact};
 use std::path::Path;
-
-#[path = "../src/main.rs"]
-mod main;
 
 #[test]
 fn test_is_artifact() {
@@ -86,14 +83,14 @@ fn test_find_project_root() {
     // Test 1: Directory without project root returns itself
     let test_dir = temp_dir.join("some_dir");
     fs::create_dir_all(&test_dir).ok();
-    let root = main::find_project_root(&test_dir);
+    let root = find_project_root(&test_dir);
     assert!(root.is_some());
     assert_eq!(root.unwrap(), test_dir);
 
     // Test 2: File without project root returns parent directory
     let test_file = test_dir.join("file.txt");
     fs::write(&test_file, "test").ok();
-    let root = main::find_project_root(&test_file);
+    let root = find_project_root(&test_file);
     assert!(root.is_some());
     assert_eq!(root.unwrap(), test_dir);
 
@@ -106,7 +103,7 @@ fn test_find_project_root() {
     fs::create_dir_all(nested_file.parent().unwrap()).ok();
     fs::write(&nested_file, "test").ok();
 
-    let root = main::find_project_root(&nested_file);
+    let root = find_project_root(&nested_file);
     assert!(root.is_some());
     assert_eq!(root.unwrap(), project_dir);
 
