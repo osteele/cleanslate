@@ -239,3 +239,44 @@ patterns = [
   ".stack-work",
   "dist-newstyle"
 ]
+
+# LaTeX/TeX artifacts
+[latex]
+name = "LaTeX/TeX"
+
+[latex.build]
+patterns = [
+  "*.aux",
+  "*.log",
+  "*.out",
+  "*.toc",
+  "*.bbl",
+  "*.blg",
+  "*.fls",
+  "*.fdb_latexmk",
+  "*.synctex.gz",
+  "*.synctex.gz(busy)",
+  "*.lof",
+  "*.lot",
+  "*.nav",
+  "*.snm",
+  "*.vrb",
+  "*.bcf",
+  "*.run.xml",
+  "*.idx",
+  "*.ilg",
+  "*.ind",
+  "*.glo",
+  "*.gls",
+  "*.glg",
+  "*.acn",
+  "*.acr",
+  "*.alg",
+  "*.xdv"
+]
+
+[latex.intermediate]
+patterns = [
+  "*.dvi",
+  "*.ps"
+]
