@@ -41,6 +41,22 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+/// Options controlling scan behavior (runtime flags)
+#[derive(Clone, Copy)]
+struct ScanOptions {
+    delete: bool,
+    verbose: bool,
+    dry_run: bool,
+    list: bool,
+    calculate_sizes: bool,
+}
+
+/// Context for time-based filtering, including the filter and statistics
+struct TimeFilterContext<'a> {
+    filter: &'a TimeFilter,
+    stats: &'a mut TimeFilterStats,
+}
+
 #[derive(Parser, Debug)]
 #[command(
     author,
@@ -940,27 +956,22 @@ fn handle_directory_artifact(
     project_root: &Path,
     projects: &mut HashMap<PathBuf, ProjectReport>,
     skip_paths: &Arc<Mutex<HashSet<PathBuf>>>,
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
-    time_filter: &TimeFilter,
-    stats: &mut TimeFilterStats,
-    calculate_sizes: bool,
+    options: ScanOptions,
+    time_ctx: &mut TimeFilterContext,
 ) -> Result<u64> {
     let mut total_bytes = 0u64;
 
-    stats.total_found += 1;
+    time_ctx.stats.total_found += 1;
 
     // Detect VCS type once for this directory
     let (vcs_type, vcs_root) = detect_vcs(path);
     let vcs_root = vcs_root.unwrap_or_else(|| start_path.to_path_buf());
 
     // Check time filter for directories (using directory's own modification time)
-    let passes_time_filter = if time_filter.is_active() {
+    let passes_time_filter = if time_ctx.filter.is_active() {
         if let Ok(metadata) = fs::symlink_metadata(path) {
             if let Ok(mtime) = metadata.modified() {
-                time_filter.passes(mtime)
+                time_ctx.filter.passes(mtime)
             } else {
                 true // If we can't get mtime, assume it passes
             }
@@ -972,17 +983,17 @@ fn handle_directory_artifact(
     };
 
     if passes_time_filter {
-        stats.passed_time_filter += 1;
+        time_ctx.stats.passed_time_filter += 1;
     } else {
-        stats.excluded_by_time += 1;
-        if verbose {
+        time_ctx.stats.excluded_by_time += 1;
+        if options.verbose {
             println!("Directory filtered by time: {}", path.display());
         }
     }
 
     // Category 2: Recreatable directories (spot-check)
     if is_recreatable_dir(path) {
-        if verbose {
+        if options.verbose {
             println!(
                 "DEBUG: Spot-checking Category 2 directory: {}",
                 path.display()
@@ -991,7 +1002,7 @@ fn handle_directory_artifact(
 
         // Spot-check: Does this directory contain ANY tracked files?
         if has_tracked_files(path, vcs_type, &vcs_root) {
-            if verbose {
+            if options.verbose {
                 println!("  Contains tracked files, skipping");
             }
             skip_paths.lock().unwrap().insert(path.to_path_buf());
@@ -1000,7 +1011,7 @@ fn handle_directory_artifact(
 
         // No tracked files → entire directory can be removed
         // Skip size calculation unless explicitly requested
-        let dir_size = if calculate_sizes {
+        let dir_size = if options.calculate_sizes {
             calculate_total_dir_size(path)
         } else {
             0 // Size not calculated
@@ -1018,21 +1029,21 @@ fn handle_directory_artifact(
             });
 
         // Remove entire directory if in delete mode AND passes time filter
-        let should_remove = passes_time_filter && (delete || dry_run);
-        if should_remove && delete && !dry_run {
+        let should_remove = passes_time_filter && (options.delete || options.dry_run);
+        if should_remove && options.delete && !options.dry_run {
             match fs::remove_dir_all(path) {
                 Ok(_) => {
-                    if verbose {
+                    if options.verbose {
                         println!("Removed directory: {}", path.display());
                     }
                 }
                 Err(err) => {
-                    if verbose {
+                    if options.verbose {
                         eprintln!("Error removing {}: {}", path.display(), err);
                     }
                 }
             }
-        } else if should_remove && dry_run && list {
+        } else if should_remove && options.dry_run && options.list {
             println!("Would remove directory: {}", path.display());
         }
 
@@ -1053,7 +1064,7 @@ fn handle_directory_artifact(
     }
 
     // Category 3: Other directories (batch-check contents)
-    if verbose {
+    if options.verbose {
         println!(
             "DEBUG: Batch-checking Category 3 directory: {}",
             path.display()
@@ -1063,7 +1074,7 @@ fn handle_directory_artifact(
     // Get all tracked files in this directory with a single VCS call
     let tracked_files = get_tracked_files_batch(path, vcs_type, &vcs_root);
 
-    if verbose {
+    if options.verbose {
         println!("  Found {} tracked files", tracked_files.len());
     }
 
@@ -1081,10 +1092,10 @@ fn handle_directory_artifact(
         // Check if file is tracked (O(1) lookup in HashSet)
         if !tracked_files.contains(file_path) {
             // Category 3: Check each file's mtime individually
-            let file_passes_time_filter = if time_filter.is_active() {
+            let file_passes_time_filter = if time_ctx.filter.is_active() {
                 if let Ok(meta) = fs::symlink_metadata(file_path) {
                     if let Ok(mtime) = meta.modified() {
-                        time_filter.passes(mtime)
+                        time_ctx.filter.passes(mtime)
                     } else {
                         true // If we can't get mtime, assume it passes
                     }
@@ -1097,7 +1108,7 @@ fn handle_directory_artifact(
 
             // Only add to removal list if it passes time filter
             if file_passes_time_filter {
-                let file_size = if calculate_sizes {
+                let file_size = if options.calculate_sizes {
                     // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
                     if let Ok(meta) = fs::symlink_metadata(file_path) {
                         let size = meta.len();
@@ -1126,23 +1137,23 @@ fn handle_directory_artifact(
             });
 
         // Remove files if in delete mode (files already passed time filter check)
-        let should_remove = delete || dry_run;
-        if should_remove && delete && !dry_run {
+        let should_remove = options.delete || options.dry_run;
+        if should_remove && options.delete && !options.dry_run {
             for (file_path, _) in &files_to_remove {
                 match fs::remove_file(file_path) {
                     Ok(_) => {
-                        if verbose {
+                        if options.verbose {
                             println!("Removed: {}", file_path.display());
                         }
                     }
                     Err(err) => {
-                        if verbose {
+                        if options.verbose {
                             eprintln!("Error removing {}: {}", file_path.display(), err);
                         }
                     }
                 }
             }
-        } else if should_remove && dry_run && list {
+        } else if should_remove && options.dry_run && options.list {
             println!(
                 "Would remove: {} ({} untracked files)",
                 path.display(),
@@ -1174,18 +1185,14 @@ fn handle_file_artifact(
     metadata: &fs::Metadata,
     project_root: &Path,
     projects: &mut HashMap<PathBuf, ProjectReport>,
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
-    time_filter: &TimeFilter,
-    stats: &mut TimeFilterStats,
+    options: ScanOptions,
+    time_ctx: &mut TimeFilterContext,
 ) -> Result<u64> {
-    stats.total_found += 1;
+    time_ctx.stats.total_found += 1;
 
     // For files: check if tracked in version control
     if is_tracked_in_vcs(path) {
-        if verbose {
+        if options.verbose {
             println!("Skipping tracked file: {}", path.display());
         }
         return Ok(0);
@@ -1195,11 +1202,11 @@ fn handle_file_artifact(
     let modified_time = metadata.modified().ok();
 
     // Check time filter if active
-    let passes_time_filter = if time_filter.is_active() {
+    let passes_time_filter = if time_ctx.filter.is_active() {
         if let Some(mtime) = modified_time {
-            time_filter.passes(mtime)
+            time_ctx.filter.passes(mtime)
         } else {
-            if verbose {
+            if options.verbose {
                 println!(
                     "Warning: Could not get modification time for {}",
                     path.display()
@@ -1212,10 +1219,10 @@ fn handle_file_artifact(
     };
 
     if passes_time_filter {
-        stats.passed_time_filter += 1;
+        time_ctx.stats.passed_time_filter += 1;
     } else {
-        stats.excluded_by_time += 1;
-        if verbose {
+        time_ctx.stats.excluded_by_time += 1;
+        if options.verbose {
             println!("File filtered by time: {}", path.display());
         }
     }
@@ -1229,10 +1236,10 @@ fn handle_file_artifact(
         });
 
     // Only remove if passes time filter
-    let should_remove = passes_time_filter && (delete || dry_run);
+    let should_remove = passes_time_filter && (options.delete || options.dry_run);
     let removed = if should_remove {
-        if dry_run {
-            if list {
+        if options.dry_run {
+            if options.list {
                 println!("Would remove: {}", path.display());
             }
             false // Not actually removed in dry run
@@ -1240,7 +1247,7 @@ fn handle_file_artifact(
             // We only remove files now, directories are handled in cleanup pass
             match fs::remove_file(path) {
                 Ok(_) => {
-                    if verbose {
+                    if options.verbose {
                         println!("Removed: {}", path.display());
                     }
                     true
@@ -1396,13 +1403,9 @@ fn discover_projects_streaming(
 fn scan_project_for_artifacts(
     project_root: PathBuf,
     patterns: &[ArtifactPattern],
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
     exclude: &[String],
+    options: ScanOptions,
     time_filter: &TimeFilter,
-    calculate_sizes: bool,
 ) -> Result<ScanResult> {
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let skip_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
@@ -1486,13 +1489,17 @@ fn scan_project_for_artifacts(
 
             // Skip symlinks
             if metadata.is_symlink() {
-                if verbose {
+                if options.verbose {
                     println!("Skipping symlink: {}", path.display());
                 }
                 continue;
             }
 
             // Handle directories or files
+            let mut time_ctx = TimeFilterContext {
+                filter: time_filter,
+                stats: &mut stats,
+            };
             if metadata.is_dir() {
                 let bytes = handle_directory_artifact(
                     path,
@@ -1500,13 +1507,8 @@ fn scan_project_for_artifacts(
                     &project_root,
                     &mut projects,
                     &skip_paths,
-                    delete,
-                    verbose,
-                    dry_run,
-                    list,
-                    time_filter,
-                    &mut stats,
-                    calculate_sizes,
+                    options,
+                    &mut time_ctx,
                 )?;
                 total_bytes += bytes;
             } else {
@@ -1515,12 +1517,8 @@ fn scan_project_for_artifacts(
                     &metadata,
                     &project_root,
                     &mut projects,
-                    delete,
-                    verbose,
-                    dry_run,
-                    list,
-                    time_filter,
-                    &mut stats,
+                    options,
+                    &mut time_ctx,
                 )?;
                 total_bytes += bytes;
             }
@@ -1540,17 +1538,13 @@ fn scan_project_for_artifacts(
 fn scan_single_path(
     start_path_str: &str,
     patterns: &[ArtifactPattern],
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
     exclude: &[String],
+    options: ScanOptions,
     time_filter: &TimeFilter,
-    calculate_sizes: bool,
 ) -> Result<ScanResult> {
     let start_path = PathBuf::from(start_path_str);
 
-    if verbose {
+    if options.verbose {
         println!("DEBUG: Scanning directory {}", start_path.display());
     }
 
@@ -1588,17 +1582,7 @@ fn scan_single_path(
         .into_iter()
         .par_bridge()
         .map(|project_root| {
-            scan_project_for_artifacts(
-                project_root,
-                patterns,
-                delete,
-                verbose,
-                dry_run,
-                list,
-                exclude,
-                time_filter,
-                calculate_sizes,
-            )
+            scan_project_for_artifacts(project_root, patterns, exclude, options, time_filter)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1641,15 +1625,11 @@ fn scan_single_path(
 
 fn scan_for_artifacts(
     paths: &[String],
-    delete: bool,
-    verbose: bool,
-    dry_run: bool,
-    list: bool,
+    options: ScanOptions,
     aggressive: bool,
     exclude: Vec<String>,
     older_than: Option<String>,
     modified_before: Option<String>,
-    calculate_sizes: bool,
 ) -> Result<()> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
@@ -1685,19 +1665,7 @@ fn scan_for_artifacts(
     // Scan paths in parallel
     let results: Vec<ScanResult> = unique_path_strings
         .par_iter()
-        .map(|path| {
-            scan_single_path(
-                path,
-                &patterns,
-                delete,
-                verbose,
-                dry_run,
-                list,
-                &exclude,
-                &time_filter,
-                calculate_sizes,
-            )
-        })
+        .map(|path| scan_single_path(path, &patterns, &exclude, options, &time_filter))
         .collect::<Result<Vec<_>>>()?;
 
     // Merge results from parallel scans
@@ -1722,7 +1690,7 @@ fn scan_for_artifacts(
     }
 
     // Cleanup pass: Remove empty directories
-    if delete && !dry_run {
+    if options.delete && !options.dry_run {
         // Collect all directories to check - both artifact dirs and parent dirs of removed files
         let mut dirs_to_check: HashSet<PathBuf> = HashSet::new();
 
@@ -1807,12 +1775,12 @@ fn scan_for_artifacts(
                         // Directory is empty or now empty, try to remove it
                         match fs::remove_dir(&dir) {
                             Ok(_) => {
-                                if verbose {
+                                if options.verbose {
                                     println!("Removed empty directory: {}", dir.display());
                                 }
                             }
                             Err(err) => {
-                                if verbose {
+                                if options.verbose {
                                     eprintln!(
                                         "Warning: Failed to remove directory {}: {}",
                                         dir.display(),
@@ -1833,7 +1801,7 @@ fn scan_for_artifacts(
 
     if projects.is_empty() {
         println!("No artifacts found.");
-    } else if !list {
+    } else if !options.list {
         // Table format (default): alphabetized, relative paths, omit empty projects
         use terminal_size::{terminal_size, Width};
 
@@ -1849,7 +1817,7 @@ fn scan_for_artifacts(
             .iter()
             .filter(|(_, report)| {
                 // If calculating sizes, filter by size. Otherwise, just check if there are artifacts.
-                if calculate_sizes {
+                if options.calculate_sizes {
                     let total: u64 = report.artifacts.iter().map(|a| a.size).sum();
                     total > 0
                 } else {
@@ -1893,15 +1861,15 @@ fn scan_for_artifacts(
             .min(40); // Cap path width at 40 chars
 
         // Fixed widths for size columns (only if calculate_sizes is enabled)
-        let removable_width = if calculate_sizes { 12 } else { 0 };
-        let too_recent_width = if calculate_sizes && time_filter.is_active() {
+        let removable_width = if options.calculate_sizes { 12 } else { 0 };
+        let too_recent_width = if options.calculate_sizes && time_filter.is_active() {
             12
         } else {
             0
         };
 
         // Calculate What column width
-        let separator_width = if calculate_sizes {
+        let separator_width = if options.calculate_sizes {
             if time_filter.is_active() {
                 6
             } else {
@@ -1918,7 +1886,7 @@ fn scan_for_artifacts(
             .max(20);
 
         // Print header - hide size columns when not calculated
-        if !calculate_sizes {
+        if !options.calculate_sizes {
             // No size columns
             println!("{:<path_w$}  What", "Path", path_w = max_path_width);
         } else if time_filter.is_active() {
@@ -2039,7 +2007,7 @@ fn scan_for_artifacts(
             let what_display = what_parts.join(", ");
 
             // Print row based on whether sizes are calculated
-            if !calculate_sizes {
+            if !options.calculate_sizes {
                 // No size columns - just path and what
                 println!(
                     "{:<path_w$}  {}",
@@ -2089,7 +2057,7 @@ fn scan_for_artifacts(
         println!("{}", "─".repeat(terminal_width.min(120)));
 
         // Print total row
-        if !calculate_sizes {
+        if !options.calculate_sizes {
             // Show count of projects and artifacts instead of sizes
             println!(
                 "\nFound {} artifact(s) across {} project(s). Use --calculate-sizes to see sizes.",
@@ -2117,7 +2085,7 @@ fn scan_for_artifacts(
         }
 
         // Show deletion summary for table format
-        if delete && !dry_run {
+        if options.delete && !options.dry_run {
             let removed_bytes: u64 = projects
                 .values()
                 .flat_map(|r| &r.artifacts)
@@ -2128,9 +2096,9 @@ fn scan_for_artifacts(
                 "\nTotal Size Removed: {}",
                 format_size(removed_bytes, BINARY).bold().red()
             );
-        } else if dry_run {
+        } else if options.dry_run {
             println!("\nDry run mode: No files were deleted.");
-        } else if !delete && total_removable > 0 {
+        } else if !options.delete && total_removable > 0 {
             // Show command to actually delete when not in delete mode and there are removable files
             let mut cmd = String::from("cleanslate --delete");
             if let Some(days) = older_than {
@@ -2183,7 +2151,7 @@ fn scan_for_artifacts(
             let total_project_size = removable_size + too_recent_size;
 
             // Skip empty projects - check artifact count when sizes not calculated
-            let has_artifacts = if calculate_sizes {
+            let has_artifacts = if options.calculate_sizes {
                 total_project_size > 0
             } else {
                 !report.artifacts.is_empty()
@@ -2268,7 +2236,7 @@ fn scan_for_artifacts(
             "Total Size Found: {}",
             format_size(total_bytes, BINARY).bold()
         );
-        if delete && !dry_run {
+        if options.delete && !options.dry_run {
             let removed_bytes: u64 = projects
                 .values()
                 .flat_map(|r| &r.artifacts)
@@ -2279,9 +2247,9 @@ fn scan_for_artifacts(
                 "Total Size Removed: {}",
                 format_size(removed_bytes, BINARY).bold().red()
             );
-        } else if dry_run {
+        } else if options.dry_run {
             println!("Dry run mode: No files were deleted.");
-        } else if !delete && total_bytes > 0 {
+        } else if !options.delete && total_bytes > 0 {
             // Show command to actually delete when not in delete mode and there are removable files
             let mut cmd = String::from("cleanslate --delete");
             if let Some(days) = older_than {
@@ -2322,17 +2290,21 @@ fn scan_for_artifacts(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    let options = ScanOptions {
+        delete: args.delete,
+        verbose: args.verbose,
+        dry_run: args.dry_run,
+        list: args.list,
+        calculate_sizes: args.calculate_sizes,
+    };
+
     scan_for_artifacts(
         &args.paths,
-        args.delete,
-        args.verbose,
-        args.dry_run,
-        args.list,
+        options,
         args.aggressive,
         args.exclude,
         args.older_than,
         args.modified_before,
-        args.calculate_sizes,
     )?;
 
     Ok(())
