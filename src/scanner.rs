@@ -2,7 +2,10 @@
 
 use crate::patterns::{is_artifact, is_project_root, is_recreatable_dir, ArtifactPattern};
 use crate::time::{TimeFilter, TimeFilterContext, TimeFilterStats};
-use crate::vcs::{detect_vcs, get_tracked_files_batch, has_tracked_files, is_tracked_in_vcs, VCS_INTERNALS};
+use crate::vcs::{
+    detect_vcs, get_tracked_files_batch, has_tracked_files, is_tracked_in_vcs, VcsCheckResult,
+    VCS_INTERNALS,
+};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Sender};
@@ -185,12 +188,28 @@ fn handle_directory_artifact(
         }
 
         // Spot-check: Does this directory contain ANY tracked files?
-        if has_tracked_files(path, vcs_type, &vcs_root) {
-            if options.verbose {
-                println!("  Contains tracked files, skipping");
+        match has_tracked_files(path, vcs_type, &vcs_root) {
+            Some(true) => {
+                if options.verbose {
+                    println!("  Contains tracked files, skipping");
+                }
+                skip_paths.lock().unwrap().insert(path.to_path_buf());
+                return Ok(0);
             }
-            skip_paths.lock().unwrap().insert(path.to_path_buf());
-            return Ok(0);
+            None => {
+                // VCS check failed - skip removal to be safe
+                if options.verbose {
+                    eprintln!(
+                        "Warning: VCS check failed for {}, skipping to be safe",
+                        path.display()
+                    );
+                }
+                skip_paths.lock().unwrap().insert(path.to_path_buf());
+                return Ok(0);
+            }
+            Some(false) => {
+                // No tracked files, continue with removal
+            }
         }
 
         // No tracked files → entire directory can be removed
@@ -256,7 +275,21 @@ fn handle_directory_artifact(
     }
 
     // Get all tracked files in this directory with a single VCS call
-    let tracked_files = get_tracked_files_batch(path, vcs_type, &vcs_root);
+    let tracked_files = match get_tracked_files_batch(path, vcs_type, &vcs_root) {
+        Ok(files) => files,
+        Err(e) => {
+            // VCS check failed - skip this directory to be safe
+            if options.verbose {
+                eprintln!(
+                    "Warning: VCS check failed for {}: {}, skipping to be safe",
+                    path.display(),
+                    e
+                );
+            }
+            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            return Ok(0);
+        }
+    };
 
     if options.verbose {
         println!("  Found {} tracked files", tracked_files.len());
@@ -375,11 +408,27 @@ fn handle_file_artifact(
     time_ctx.stats.total_found += 1;
 
     // For files: check if tracked in version control
-    if is_tracked_in_vcs(path) {
-        if options.verbose {
-            println!("Skipping tracked file: {}", path.display());
+    match is_tracked_in_vcs(path) {
+        VcsCheckResult::Tracked => {
+            if options.verbose {
+                println!("Skipping tracked file: {}", path.display());
+            }
+            return Ok(0);
         }
-        return Ok(0);
+        VcsCheckResult::Unknown(e) => {
+            // VCS check failed - skip removal to be safe
+            if options.verbose {
+                eprintln!(
+                    "Warning: VCS check failed for {}: {}, skipping to be safe",
+                    path.display(),
+                    e
+                );
+            }
+            return Ok(0);
+        }
+        VcsCheckResult::Untracked => {
+            // Continue with removal
+        }
     }
 
     // Extract modification time

@@ -156,3 +156,194 @@ pub fn parse_duration(duration_str: &str) -> Result<Duration> {
 
     Ok(Duration::from_secs(seconds))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ============ parse_duration tests ============
+
+    #[test]
+    fn test_parse_duration_default_days() {
+        let duration = parse_duration("15").unwrap();
+        assert_eq!(duration.as_secs(), 15 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_explicit_days() {
+        let duration = parse_duration("15d").unwrap();
+        assert_eq!(duration.as_secs(), 15 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_days_uppercase() {
+        let duration = parse_duration("15D").unwrap();
+        assert_eq!(duration.as_secs(), 15 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_hours() {
+        let duration = parse_duration("48h").unwrap();
+        assert_eq!(duration.as_secs(), 48 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_hours_uppercase() {
+        let duration = parse_duration("48H").unwrap();
+        assert_eq!(duration.as_secs(), 48 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_weeks() {
+        let duration = parse_duration("2w").unwrap();
+        assert_eq!(duration.as_secs(), 2 * 7 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_weeks_uppercase() {
+        let duration = parse_duration("2W").unwrap();
+        assert_eq!(duration.as_secs(), 2 * 7 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_months() {
+        let duration = parse_duration("3m").unwrap();
+        assert_eq!(duration.as_secs(), 3 * 30 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_months_uppercase() {
+        let duration = parse_duration("3M").unwrap();
+        assert_eq!(duration.as_secs(), 3 * 30 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_zero() {
+        let duration = parse_duration("0d").unwrap();
+        assert_eq!(duration.as_secs(), 0);
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_unit() {
+        let result = parse_duration("15x");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid duration unit"));
+    }
+
+    #[test]
+    fn test_parse_duration_invalid_number() {
+        let result = parse_duration("abc");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Expected a number"));
+    }
+
+    #[test]
+    fn test_parse_duration_with_whitespace() {
+        let duration = parse_duration("  15d  ").unwrap();
+        assert_eq!(duration.as_secs(), 15 * 24 * 60 * 60);
+    }
+
+    // ============ parse_date tests ============
+
+    #[test]
+    fn test_parse_date_valid() {
+        let result = parse_date("2025-01-15");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_date_leap_year() {
+        let result = parse_date("2000-02-29");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_date_invalid_format() {
+        let result = parse_date("01-15-2025");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Invalid date format"));
+    }
+
+    #[test]
+    fn test_parse_date_invalid_date() {
+        let result = parse_date("2025-02-30");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_date_year_too_old() {
+        let result = parse_date("1900-01-01");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Year must be between"));
+    }
+
+    #[test]
+    fn test_parse_date_year_too_new() {
+        let result = parse_date("2200-01-01");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Year must be between"));
+    }
+
+    #[test]
+    fn test_parse_date_boundary_years() {
+        assert!(parse_date("1970-01-01").is_ok());
+        assert!(parse_date("2100-12-31").is_ok());
+    }
+
+    // ============ TimeFilter tests ============
+
+    #[test]
+    fn test_time_filter_inactive() {
+        let filter = TimeFilter::from_args(None, None).unwrap();
+        assert!(!filter.is_active());
+    }
+
+    #[test]
+    fn test_time_filter_older_than_active() {
+        let filter = TimeFilter::from_args(Some("7d"), None).unwrap();
+        assert!(filter.is_active());
+    }
+
+    #[test]
+    fn test_time_filter_modified_before_active() {
+        let filter = TimeFilter::from_args(None, Some("2025-01-01")).unwrap();
+        assert!(filter.is_active());
+    }
+
+    #[test]
+    fn test_time_filter_both_active() {
+        let filter = TimeFilter::from_args(Some("7d"), Some("2025-01-01")).unwrap();
+        assert!(filter.is_active());
+    }
+
+    #[test]
+    fn test_time_filter_passes_no_filter() {
+        let filter = TimeFilter::from_args(None, None).unwrap();
+        let now = SystemTime::now();
+        assert!(filter.passes(now));
+    }
+
+    #[test]
+    fn test_time_filter_passes_old_file() {
+        let filter = TimeFilter::from_args(Some("7d"), None).unwrap();
+        // A file from 30 days ago should pass
+        let old_time = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        assert!(filter.passes(old_time));
+    }
+
+    #[test]
+    fn test_time_filter_fails_new_file() {
+        let filter = TimeFilter::from_args(Some("7d"), None).unwrap();
+        // A file from 1 day ago should fail (too new)
+        let new_time = SystemTime::now() - Duration::from_secs(1 * 24 * 60 * 60);
+        assert!(!filter.passes(new_time));
+    }
+
+    #[test]
+    fn test_time_filter_stats_default() {
+        let stats = TimeFilterStats::default();
+        assert_eq!(stats.total_found, 0);
+        assert_eq!(stats.passed_time_filter, 0);
+        assert_eq!(stats.excluded_by_time, 0);
+    }
+}

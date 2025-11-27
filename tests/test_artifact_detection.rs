@@ -1,4 +1,4 @@
-use cleanslate::{find_project_root, get_artifact_patterns, is_artifact};
+use cleanslate::{find_project_root, get_artifact_patterns, is_artifact, is_recreatable_dir};
 use std::path::Path;
 
 #[test]
@@ -150,4 +150,81 @@ fn test_pattern_prefix_behavior() {
         is_artifact(Path::new("/some/nested/path/.DS_Store"), &patterns),
         ".DS_Store should match in nested paths"
     );
+}
+
+// ============ is_recreatable_dir tests ============
+
+#[test]
+fn test_is_recreatable_dir_node_modules() {
+    assert!(
+        is_recreatable_dir(Path::new("/some/path/node_modules")),
+        "node_modules should be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_venv() {
+    assert!(
+        is_recreatable_dir(Path::new("/some/path/.venv")),
+        ".venv should be recreatable"
+    );
+    assert!(
+        is_recreatable_dir(Path::new("/some/path/venv")),
+        "venv should be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_target() {
+    assert!(
+        is_recreatable_dir(Path::new("/some/path/target")),
+        "target should be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_pycache() {
+    assert!(
+        is_recreatable_dir(Path::new("/some/path/__pycache__")),
+        "__pycache__ should be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_src_not_recreatable() {
+    assert!(
+        !is_recreatable_dir(Path::new("/some/path/src")),
+        "src should NOT be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_multi_component() {
+    // vendor/bundle is a multi-component pattern
+    assert!(
+        is_recreatable_dir(Path::new("/project/vendor/bundle")),
+        "vendor/bundle should be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_false_positive_check() {
+    // /catalogs/bundle should NOT match vendor/bundle pattern
+    assert!(
+        !is_recreatable_dir(Path::new("/catalogs/bundle")),
+        "catalogs/bundle should NOT be detected as recreatable (false positive)"
+    );
+    // but just "bundle" alone isn't in the list either
+    assert!(
+        !is_recreatable_dir(Path::new("/some/bundle")),
+        "bundle alone should NOT be recreatable"
+    );
+}
+
+#[test]
+fn test_is_recreatable_dir_cache_directories() {
+    assert!(is_recreatable_dir(Path::new("/path/.cache")));
+    assert!(is_recreatable_dir(Path::new("/path/.pytest_cache")));
+    assert!(is_recreatable_dir(Path::new("/path/.mypy_cache")));
+    assert!(is_recreatable_dir(Path::new("/path/.ruff_cache")));
 }
