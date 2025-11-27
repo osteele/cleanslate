@@ -816,17 +816,13 @@ fn is_tracked_in_vcs(path: &Path) -> bool {
     }
 
     // Check jj first (since projects using jj also have .git)
-    if path.ancestors().any(|p| p.join(".jj").exists()) {
-        if is_tracked_in_jj(path) {
-            return true;
-        }
+    if path.ancestors().any(|p| p.join(".jj").exists()) && is_tracked_in_jj(path) {
+        return true;
     }
 
     // Then check git
-    if path.ancestors().any(|p| p.join(".git").exists()) {
-        if is_tracked_in_git(path) {
-            return true;
-        }
+    if path.ancestors().any(|p| p.join(".git").exists()) && is_tracked_in_git(path) {
+        return true;
     }
 
     false
@@ -1330,7 +1326,7 @@ fn discover_projects_streaming(
             }
 
             // Skip user-excluded directories
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
+            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if should_exclude_path(path, &exclude_clone) {
                     return false;
                 }
@@ -1372,11 +1368,11 @@ fn discover_projects_streaming(
         let path = entry.path();
 
         // Check if this was marked as a project root (already added to discovered_projects in filter_entry)
-        if discovered_projects.lock().unwrap().contains(path) {
-            if sender.send(path.to_path_buf()).is_err() {
-                // Receiver dropped, stop discovering
-                break;
-            }
+        if discovered_projects.lock().unwrap().contains(path)
+            && sender.send(path.to_path_buf()).is_err()
+        {
+            // Receiver dropped, stop discovering
+            break;
         }
     }
 
@@ -1436,10 +1432,10 @@ fn scan_project_for_artifacts(
             }
 
             // Skip user-excluded directories
-            if entry.file_type().map_or(false, |ft| ft.is_dir()) {
-                if should_exclude_path(path, &exclude_clone) {
-                    return false;
-                }
+            if entry.file_type().is_some_and(|ft| ft.is_dir())
+                && should_exclude_path(path, &exclude_clone)
+            {
+                return false;
             }
 
             true
@@ -1886,7 +1882,7 @@ fn scan_for_artifacts(
         let max_path_width = sorted_projects
             .iter()
             .map(|(path, _)| {
-                path.strip_prefix(&start_path)
+                path.strip_prefix(start_path)
                     .unwrap_or(path)
                     .display()
                     .to_string()
@@ -1924,24 +1920,22 @@ fn scan_for_artifacts(
         // Print header - hide size columns when not calculated
         if !calculate_sizes {
             // No size columns
-            println!("{:<path_w$}  {}", "Path", "What", path_w = max_path_width);
+            println!("{:<path_w$}  What", "Path", path_w = max_path_width);
         } else if time_filter.is_active() {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
+                "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  What",
                 "Path",
                 "Removable",
                 "Too Recent",
-                "What",
                 path_w = max_path_width,
                 rem_w = removable_width,
                 rec_w = too_recent_width
             );
         } else {
             println!(
-                "{:<path_w$}  {:>rem_w$}  {}",
+                "{:<path_w$}  {:>rem_w$}  What",
                 "Path",
                 "Removable",
-                "What",
                 path_w = max_path_width,
                 rem_w = removable_width
             );
@@ -1973,7 +1967,7 @@ fn scan_for_artifacts(
             total_too_recent += too_recent_size;
 
             let relative_path = project_dir
-                .strip_prefix(&start_path)
+                .strip_prefix(start_path)
                 .unwrap_or(project_dir)
                 .display()
                 .to_string();
@@ -2006,7 +2000,7 @@ fn scan_for_artifacts(
 
             for (name, size) in &artifacts_with_size {
                 let formatted = if *size > large_threshold {
-                    format!("{}", name).bold().to_string()
+                    name.bold().to_string()
                 } else {
                     name.clone()
                 };
@@ -2151,7 +2145,7 @@ fn scan_for_artifacts(
             for ex in &exclude {
                 cmd.push_str(&format!(" --exclude {}", ex));
             }
-            if paths.len() > 0 && paths[0] != "." {
+            if !paths.is_empty() && paths[0] != "." {
                 for path in paths {
                     cmd.push_str(&format!(" {}", path));
                 }
@@ -2200,7 +2194,7 @@ fn scan_for_artifacts(
 
             // Get relative path from search root
             let relative_path = project_dir
-                .strip_prefix(&start_path)
+                .strip_prefix(start_path)
                 .unwrap_or(project_dir)
                 .display()
                 .to_string();
@@ -2302,7 +2296,7 @@ fn scan_for_artifacts(
             for ex in &exclude {
                 cmd.push_str(&format!(" --exclude {}", ex));
             }
-            if paths.len() > 0 && paths[0] != "." {
+            if !paths.is_empty() && paths[0] != "." {
                 for path in paths {
                     cmd.push_str(&format!(" {}", path));
                 }
