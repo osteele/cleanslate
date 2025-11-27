@@ -23,7 +23,7 @@
 //! resulting in 100-10,000x speedup for large projects.
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use clap::Parser;
 use colored::Colorize;
 use crossbeam_channel::{bounded, Sender};
@@ -160,23 +160,23 @@ fn parse_date(date_str: &str) -> Result<SystemTime> {
         )
     })?;
 
-    // Convert to SystemTime via Unix timestamp
     // NaiveDate doesn't have year limits, so add validation
     let year = date.year();
     if !(1970..=2100).contains(&year) {
         anyhow::bail!("Year must be between 1970 and 2100, got: {}", year);
     }
 
-    // Calculate days since Unix epoch (1970-01-01)
-    let epoch_date = NaiveDate::from_ymd_opt(1970, 1, 1).context("Failed to create epoch date")?;
-    let days_since_epoch = date.signed_duration_since(epoch_date).num_days();
+    // Convert to local midnight, then to SystemTime
+    // This interprets the date in the user's local timezone, not UTC
+    let naive_datetime = date
+        .and_hms_opt(0, 0, 0)
+        .context("Failed to create midnight time")?;
+    let local_datetime = Local
+        .from_local_datetime(&naive_datetime)
+        .single()
+        .context("Ambiguous or invalid local time")?;
 
-    if days_since_epoch < 0 {
-        anyhow::bail!("Date must be on or after 1970-01-01");
-    }
-
-    let duration = Duration::from_secs((days_since_epoch * 24 * 60 * 60) as u64);
-    Ok(SystemTime::UNIX_EPOCH + duration)
+    Ok(local_datetime.into())
 }
 
 /// Parse a duration string with optional unit suffix
@@ -1317,7 +1317,8 @@ fn discover_projects_streaming(
                 let mut count = entries_scanned_clone.lock().unwrap();
                 *count += 1;
                 if *count % 100 == 0 {
-                    progress_clone.set_message(format!("Discovering projects: {} entries scanned", count));
+                    progress_clone
+                        .set_message(format!("Discovering projects: {} entries scanned", count));
                 }
             }
 
@@ -1345,7 +1346,10 @@ fn discover_projects_streaming(
                 // Check if this directory IS a project root
                 if is_project_root(path) {
                     // Mark it as discovered to prevent descending into subdirectories
-                    discovered_projects_clone.lock().unwrap().insert(path.to_path_buf());
+                    discovered_projects_clone
+                        .lock()
+                        .unwrap()
+                        .insert(path.to_path_buf());
                     *discovered_count_clone.lock().unwrap() += 1;
                     // Note: We still return true to allow the walker to yield this entry
                     // so we can send it in the main loop
@@ -1376,8 +1380,18 @@ fn discover_projects_streaming(
         }
     }
 
-    let count = discovered_count.lock().unwrap();
-    progress.set_message(format!("Discovered {} projects, scanning artifacts...", *count));
+    let count = *discovered_count.lock().unwrap();
+    if count == 0 {
+        // Fallback: scan start_path itself when no projects discovered
+        // This handles directories with artifacts but no project markers
+        sender.send(start_path.to_path_buf()).ok();
+        progress.set_message("No projects found, scanning directory directly...".to_string());
+    } else {
+        progress.set_message(format!(
+            "Discovered {} projects, scanning artifacts...",
+            count
+        ));
+    }
     Ok(())
 }
 
@@ -1436,7 +1450,11 @@ fn scan_project_for_artifacts(
         let entry = match result {
             Ok(entry) => entry,
             Err(err) => {
-                eprintln!("Warning: Failed to access entry in {}: {}", project_root.display(), err);
+                eprintln!(
+                    "Warning: Failed to access entry in {}: {}",
+                    project_root.display(),
+                    err
+                );
                 continue;
             }
         };
@@ -1461,7 +1479,11 @@ fn scan_project_for_artifacts(
             let metadata = match fs::symlink_metadata(path) {
                 Ok(meta) => meta,
                 Err(err) => {
-                    eprintln!("Warning: Could not get metadata for {}: {}", path.display(), err);
+                    eprintln!(
+                        "Warning: Could not get metadata for {}: {}",
+                        path.display(),
+                        err
+                    );
                     continue;
                 }
             };
@@ -1541,7 +1563,7 @@ fn scan_single_path(
     progress.set_style(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} [{elapsed_precise}] {msg}")
-            .unwrap()
+            .unwrap(),
     );
     progress.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -1585,7 +1607,9 @@ fn scan_single_path(
         .collect::<Result<Vec<_>>>()?;
 
     // Wait for producer to finish
-    producer_handle.join().map_err(|_| anyhow::anyhow!("Producer thread panicked"))??;
+    producer_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("Producer thread panicked"))??;
 
     // Merge results from parallel processing
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
@@ -1874,13 +1898,21 @@ fn scan_for_artifacts(
 
         // Fixed widths for size columns (only if calculate_sizes is enabled)
         let removable_width = if calculate_sizes { 12 } else { 0 };
-        let too_recent_width = if calculate_sizes && time_filter.is_active() { 12 } else { 0 };
+        let too_recent_width = if calculate_sizes && time_filter.is_active() {
+            12
+        } else {
+            0
+        };
 
         // Calculate What column width
         let separator_width = if calculate_sizes {
-            if time_filter.is_active() { 6 } else { 4 }
+            if time_filter.is_active() {
+                6
+            } else {
+                4
+            }
         } else {
-            2  // Just "Path  What"
+            2 // Just "Path  What"
         };
         let what_width = terminal_width
             .saturating_sub(max_path_width)
@@ -1892,12 +1924,7 @@ fn scan_for_artifacts(
         // Print header - hide size columns when not calculated
         if !calculate_sizes {
             // No size columns
-            println!(
-                "{:<path_w$}  {}",
-                "Path",
-                "What",
-                path_w = max_path_width
-            );
+            println!("{:<path_w$}  {}", "Path", "What", path_w = max_path_width);
         } else if time_filter.is_active() {
             println!(
                 "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
@@ -2063,7 +2090,6 @@ fn scan_for_artifacts(
                     );
                 }
             }
-
         }
 
         println!("{}", "─".repeat(terminal_width.min(120)));
@@ -2162,8 +2188,13 @@ fn scan_for_artifacts(
                 .sum();
             let total_project_size = removable_size + too_recent_size;
 
-            // Skip empty projects
-            if total_project_size == 0 {
+            // Skip empty projects - check artifact count when sizes not calculated
+            let has_artifacts = if calculate_sizes {
+                total_project_size > 0
+            } else {
+                !report.artifacts.is_empty()
+            };
+            if !has_artifacts {
                 continue;
             }
 

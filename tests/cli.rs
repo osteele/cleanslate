@@ -58,9 +58,10 @@ fn test_verbose_flag() {
     let assert = cmd.arg(dir.path()).arg("--verbose").assert();
 
     // With verbose flag, we should see DEBUG messages about scanning directories
-    assert
-        .success()
-        .stdout(predicate::str::contains("DEBUG: Scanning directory").or(predicate::str::contains("DEBUG: Spot-checking")));
+    assert.success().stdout(
+        predicate::str::contains("DEBUG: Scanning directory")
+            .or(predicate::str::contains("DEBUG: Spot-checking")),
+    );
 }
 
 #[test]
@@ -72,7 +73,9 @@ fn test_delete_flag_dry_run() {
     let assert = cmd.arg(dir.path()).assert();
 
     // Without --calculate-sizes, should show artifact count message instead of "Total" row
-    assert.success().stdout(predicate::str::contains("Found").and(predicate::str::contains("artifact")));
+    assert
+        .success()
+        .stdout(predicate::str::contains("Found").and(predicate::str::contains("artifact")));
 
     // Verify that our artifacts still exist
     assert!(dir.path().join("node_modules").exists());
@@ -210,4 +213,44 @@ fn test_exclude_with_nested_directories() {
     assert
         .success()
         .stdout(predicate::str::contains("__pycache__"));
+}
+
+/// Test that non-project directories with artifacts are scanned (Fix #1)
+/// When a directory contains artifacts but no project indicators (Cargo.toml, package.json, etc.),
+/// the tool should fall back to scanning the directory directly instead of silently ignoring it.
+#[test]
+fn test_non_project_directory_with_artifacts() {
+    let dir = tempdir().unwrap();
+
+    // Create only __pycache__ - NO project indicators like Cargo.toml or package.json
+    fs::create_dir_all(dir.path().join("__pycache__")).unwrap();
+    fs::write(dir.path().join("__pycache__/test.pyc"), "compiled").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).assert();
+
+    // Should find the artifact even without a project root indicator
+    assert
+        .success()
+        .stdout(predicate::str::contains("__pycache__"));
+}
+
+/// Test that --list mode works without --calculate-sizes (Fix #2)
+/// Previously, list mode filtered out projects with zero size, which meant
+/// directory artifacts weren't shown unless --calculate-sizes was also passed.
+#[test]
+fn test_list_mode_without_calculate_sizes() {
+    let dir = setup_test_directory();
+
+    // Run with --list but without --calculate-sizes
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--list").assert();
+
+    // Should show artifacts even without size calculation
+    // The output should contain artifact names (node_modules, __pycache__, target)
+    assert
+        .success()
+        .stdout(predicate::str::contains("node_modules"))
+        .stdout(predicate::str::contains("__pycache__"))
+        .stdout(predicate::str::contains("target"));
 }
