@@ -1,4 +1,7 @@
-use cleanslate::{find_project_root, get_artifact_patterns, is_artifact, is_recreatable_dir};
+use cleanslate::{
+    find_project_root, get_artifact_patterns, is_artifact, is_recreatable_dir,
+    truncate_name_with_suffix,
+};
 use std::path::Path;
 
 #[test]
@@ -54,6 +57,10 @@ fn test_is_artifact() {
     );
     assert!(is_artifact(Path::new("/some/path/tmp"), &patterns));
     assert!(is_artifact(Path::new("/some/path/logs"), &patterns));
+    assert!(
+        !is_artifact(Path::new("/private/tmp/project/src/main.rs"), &patterns),
+        "artifact-like ancestor names must not classify ordinary descendants"
+    );
 
     // Non-artifacts
     assert!(!is_artifact(Path::new("/some/path/src"), &patterns));
@@ -150,6 +157,11 @@ fn test_pattern_prefix_behavior() {
         is_artifact(Path::new("/some/nested/path/.DS_Store"), &patterns),
         ".DS_Store should match in nested paths"
     );
+}
+
+#[test]
+fn test_truncate_name_with_multibyte_characters() {
+    assert_eq!(truncate_name_with_suffix("缓存目录名", 4), "缓...");
 }
 
 // ============ is_recreatable_dir tests ============

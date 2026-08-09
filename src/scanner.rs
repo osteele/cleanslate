@@ -81,6 +81,22 @@ fn calculate_total_dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Return whether an artifact directory contains a nested VCS checkout.
+/// Refuse wholesale cleanup when repository metadata appears anywhere below it.
+fn contains_vcs_checkout(path: &Path) -> Result<bool> {
+    for entry in walkdir::WalkDir::new(path).min_depth(1).follow_links(false) {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| VCS_INTERNALS.contains(&name))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Check if a path should be excluded based on directory name matching
 pub fn should_exclude_path(path: &Path, excludes: &[String]) -> bool {
     if excludes.is_empty() {
@@ -178,6 +194,31 @@ fn handle_directory_artifact(
         }
     }
 
+    match contains_vcs_checkout(path) {
+        Ok(true) => {
+            if options.verbose {
+                println!(
+                    "Directory contains nested version-control metadata, skipping: {}",
+                    path.display()
+                );
+            }
+            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            return Ok(0);
+        }
+        Err(error) => {
+            if options.verbose {
+                eprintln!(
+                    "Warning: Could not inspect {} for nested repositories: {}, skipping to be safe",
+                    path.display(),
+                    error
+                );
+            }
+            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            return Ok(0);
+        }
+        Ok(false) => {}
+    }
+
     // Category 2: Recreatable directories (spot-check)
     if is_recreatable_dir(path) {
         if options.verbose {
@@ -233,22 +274,25 @@ fn handle_directory_artifact(
 
         // Remove entire directory if in delete mode AND passes time filter
         let should_remove = passes_time_filter && (options.delete || options.dry_run);
-        if should_remove && options.delete && !options.dry_run {
+        let removed = if should_remove && options.delete && !options.dry_run {
             match fs::remove_dir_all(path) {
                 Ok(_) => {
                     if options.verbose {
                         println!("Removed directory: {}", path.display());
                     }
+                    true
                 }
                 Err(err) => {
-                    if options.verbose {
-                        eprintln!("Error removing {}: {}", path.display(), err);
-                    }
+                    eprintln!("Error removing {}: {}", path.display(), err);
+                    false
                 }
             }
         } else if should_remove && options.dry_run && options.list {
             println!("Would remove directory: {}", path.display());
-        }
+            false
+        } else {
+            false
+        };
 
         let dir_modified = fs::symlink_metadata(path)
             .ok()
@@ -257,7 +301,7 @@ fn handle_directory_artifact(
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_size,
-            removed: should_remove,
+            removed,
             modified: dir_modified,
             time_filtered: !passes_time_filter,
         });
@@ -355,19 +399,17 @@ fn handle_directory_artifact(
 
         // Remove files if in delete mode (files already passed time filter check)
         let should_remove = options.delete || options.dry_run;
+        let mut removed = false;
         if should_remove && options.delete && !options.dry_run {
             for (file_path, _) in &files_to_remove {
                 match fs::remove_file(file_path) {
                     Ok(_) => {
+                        removed = true;
                         if options.verbose {
                             println!("Removed: {}", file_path.display());
                         }
                     }
-                    Err(err) => {
-                        if options.verbose {
-                            eprintln!("Error removing {}: {}", file_path.display(), err);
-                        }
-                    }
+                    Err(err) => eprintln!("Error removing {}: {}", file_path.display(), err),
                 }
             }
         } else if should_remove && options.dry_run && options.list {
@@ -386,7 +428,7 @@ fn handle_directory_artifact(
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_total_size,
-            removed: should_remove,
+            removed,
             modified: dir_modified,
             time_filtered: false, // Files already passed time filter check
         });
@@ -858,11 +900,12 @@ pub fn scan_single_path(
 
 /// Truncate an artifact name with "..." suffix if it exceeds max_width
 pub fn truncate_name_with_suffix(name: &str, max_width: usize) -> String {
-    if name.len() <= max_width {
+    let character_count = name.chars().count();
+    if character_count <= max_width {
         name.to_string()
     } else if max_width >= 3 {
         let truncate_to = max_width.saturating_sub(3);
-        format!("{}...", &name[..truncate_to])
+        format!("{}...", name.chars().take(truncate_to).collect::<String>())
     } else {
         "...".to_string()
     }

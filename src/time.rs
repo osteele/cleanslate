@@ -14,7 +14,10 @@ pub struct TimeFilter {
 
 impl TimeFilter {
     /// Create a time filter from CLI arguments
-    pub fn from_args(older_than_str: Option<&str>, modified_before_str: Option<&str>) -> Result<Self> {
+    pub fn from_args(
+        older_than_str: Option<&str>,
+        modified_before_str: Option<&str>,
+    ) -> Result<Self> {
         let older_than = if let Some(duration_str) = older_than_str {
             let duration = parse_duration(duration_str)?;
             let cutoff = SystemTime::now() - duration;
@@ -227,14 +230,20 @@ mod tests {
     fn test_parse_duration_invalid_unit() {
         let result = parse_duration("15x");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid duration unit"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid duration unit"));
     }
 
     #[test]
     fn test_parse_duration_invalid_number() {
         let result = parse_duration("abc");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Expected a number"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected a number"));
     }
 
     #[test]
@@ -261,7 +270,10 @@ mod tests {
     fn test_parse_date_invalid_format() {
         let result = parse_date("01-15-2025");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid date format"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid date format"));
     }
 
     #[test]
@@ -274,14 +286,20 @@ mod tests {
     fn test_parse_date_year_too_old() {
         let result = parse_date("1900-01-01");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Year must be between"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Year must be between"));
     }
 
     #[test]
     fn test_parse_date_year_too_new() {
         let result = parse_date("2200-01-01");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Year must be between"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Year must be between"));
     }
 
     #[test]
@@ -335,7 +353,7 @@ mod tests {
     fn test_time_filter_fails_new_file() {
         let filter = TimeFilter::from_args(Some("7d"), None).unwrap();
         // A file from 1 day ago should fail (too new)
-        let new_time = SystemTime::now() - Duration::from_secs(1 * 24 * 60 * 60);
+        let new_time = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
         assert!(!filter.passes(new_time));
     }
 

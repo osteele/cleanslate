@@ -18,7 +18,9 @@ pub mod time;
 pub mod vcs;
 
 // Re-export commonly used items
-pub use patterns::{get_artifact_patterns, is_artifact, is_recreatable_dir, ArtifactPattern, ArtifactType};
+pub use patterns::{
+    get_artifact_patterns, is_artifact, is_recreatable_dir, ArtifactPattern, ArtifactType,
+};
 pub use scanner::{
     find_project_root, scan_single_path, truncate_name_with_suffix, ArtifactEntry, ProjectReport,
     ScanOptions, ScanResult,

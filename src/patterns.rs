@@ -258,20 +258,9 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
                 }
             }
         } else if filename == pattern.pattern {
-            // Exact filename match
+            // Exact names match at any traversal depth. Only inspect the candidate's
+            // filename: absolute ancestors may coincidentally be named "tmp", "env", etc.
             return true;
-        } else {
-            // Component-based matching: check if pattern matches any path component
-            // This prevents false positives like "logs" matching "/catalogs/"
-            if path.components().any(|c| {
-                if let std::path::Component::Normal(os_str) = c {
-                    os_str.to_string_lossy() == pattern.pattern
-                } else {
-                    false
-                }
-            }) {
-                return true;
-            }
         }
     }
 

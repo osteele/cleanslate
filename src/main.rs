@@ -64,6 +64,20 @@ struct Args {
     calculate_sizes: bool,
 }
 
+fn remove_overlapping_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    paths.sort_by_key(|path| path.components().count());
+    let mut unique_paths = Vec::new();
+    for path in paths {
+        if !unique_paths
+            .iter()
+            .any(|ancestor: &PathBuf| path.starts_with(ancestor))
+        {
+            unique_paths.push(path);
+        }
+    }
+    unique_paths
+}
+
 fn scan_for_artifacts(
     paths: &[String],
     options: ScanOptions,
@@ -97,7 +111,7 @@ fn scan_for_artifacts(
         }
     }
 
-    let unique_paths: Vec<PathBuf> = canonical_paths.into_iter().collect();
+    let unique_paths = remove_overlapping_paths(canonical_paths.into_iter().collect());
     let unique_path_strings: Vec<String> = unique_paths
         .iter()
         .map(|p| p.to_string_lossy().to_string())
@@ -155,48 +169,25 @@ fn scan_for_artifacts(
 }
 
 /// Remove empty directories after artifact deletion
-fn cleanup_empty_directories(
-    projects: &HashMap<PathBuf, ProjectReport>,
-    options: ScanOptions,
-) {
+fn cleanup_empty_directories(projects: &HashMap<PathBuf, ProjectReport>, options: ScanOptions) {
     // Collect all directories to check - both artifact dirs and parent dirs of removed files
     let mut dirs_to_check: HashSet<PathBuf> = HashSet::new();
 
-    for project_report in projects.values() {
+    for (project_root, project_report) in projects {
         for entry in &project_report.artifacts {
             if entry.removed {
-                // If it's a directory artifact, add it
-                if entry.path.is_dir()
-                    || entry
-                        .path
-                        .symlink_metadata()
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false)
-                {
-                    dirs_to_check.insert(entry.path.clone());
-                    // Also add all parent directories up to the project root
-                    let mut current = entry.path.as_path();
-                    while let Some(parent) = current.parent() {
-                        if dirs_to_check.insert(parent.to_path_buf()) {
-                            current = parent;
-                        } else {
-                            break; // Already added, no need to go further
-                        }
-                    }
+                let mut current = if entry.path.is_dir() {
+                    Some(entry.path.as_path())
                 } else {
-                    // For files, add parent directories
-                    if let Some(parent) = entry.path.parent() {
-                        dirs_to_check.insert(parent.to_path_buf());
-                        // Also add ancestor directories
-                        let mut current = parent;
-                        while let Some(parent) = current.parent() {
-                            if dirs_to_check.insert(parent.to_path_buf()) {
-                                current = parent;
-                            } else {
-                                break;
-                            }
-                        }
+                    entry.path.parent()
+                };
+
+                while let Some(dir) = current {
+                    if dir == project_root || !dir.starts_with(project_root) {
+                        break;
                     }
+                    dirs_to_check.insert(dir.to_path_buf());
+                    current = dir.parent();
                 }
             }
         }
@@ -207,40 +198,20 @@ fn cleanup_empty_directories(
     dirs_vec.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
 
     // Try to remove empty directories
-    // A directory is considered "empty" if it contains nothing OR only .DS_Store/Thumbs.db
+    // Only remove genuinely empty directories. Other files may be tracked or intentionally kept.
     for dir in dirs_vec {
         // Skip if doesn't exist
         if !dir.exists() {
             continue;
         }
 
-        // Check if directory is empty or only contains trivial files
+        // Check whether the directory is empty
         match fs::read_dir(&dir) {
             Ok(entries) => {
                 // Collect all entries
                 let remaining: Vec<_> = entries.filter_map(|e| e.ok()).collect();
 
-                // Check if empty or only contains .DS_Store/Thumbs.db
-                let is_effectively_empty = remaining.is_empty()
-                    || remaining.iter().all(|entry| {
-                        entry
-                            .file_name()
-                            .to_str()
-                            .map(|name| matches!(name, ".DS_Store" | "Thumbs.db"))
-                            .unwrap_or(false)
-                    });
-
-                if is_effectively_empty {
-                    // Remove trivial files first if present
-                    for entry in remaining {
-                        if let Some(name) = entry.file_name().to_str() {
-                            if matches!(name, ".DS_Store" | "Thumbs.db") {
-                                let _ = fs::remove_file(entry.path());
-                            }
-                        }
-                    }
-
-                    // Directory is empty or now empty, try to remove it
+                if remaining.is_empty() {
                     match fs::remove_dir(&dir) {
                         Ok(_) => {
                             if options.verbose {
@@ -832,4 +803,25 @@ fn main() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_overlapping_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn overlapping_scan_paths_keep_only_the_ancestor() {
+        let paths = vec![
+            PathBuf::from("/workspace/project/target"),
+            PathBuf::from("/workspace/project"),
+            PathBuf::from("/workspace/other"),
+        ];
+
+        let result = remove_overlapping_paths(paths);
+
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&PathBuf::from("/workspace/project")));
+        assert!(result.contains(&PathBuf::from("/workspace/other")));
+    }
 }

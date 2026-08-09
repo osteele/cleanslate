@@ -83,9 +83,7 @@ fn test_delete_flag_dry_run() {
     assert!(dir.path().join("target").exists());
 }
 
-// Note: This test is marked as ignored because it actually deletes files
 #[test]
-#[ignore]
 fn test_delete_flag() {
     let dir = setup_test_directory();
 
@@ -106,6 +104,60 @@ fn test_delete_flag() {
     assert!(!dir.path().join("node_modules").exists());
     assert!(!dir.path().join("__pycache__").exists());
     assert!(!dir.path().join("target").exists());
+}
+
+#[test]
+fn test_delete_preserves_scan_root_and_empty_ancestors() {
+    let dir = tempdir().unwrap();
+    let scan_root = dir.path().join("outer/project");
+    fs::create_dir_all(&scan_root).unwrap();
+    fs::write(scan_root.join("stale.log"), "log").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(&scan_root).arg("--delete").assert().success();
+
+    assert!(scan_root.exists());
+    assert!(dir.path().join("outer").exists());
+}
+
+#[test]
+fn test_delete_preserves_non_aggressive_trivial_files() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    fs::create_dir_all(dir.path().join("output")).unwrap();
+    fs::write(dir.path().join("output/stale.log"), "log").unwrap();
+    fs::write(dir.path().join("output/.DS_Store"), "metadata").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(dir.path()).arg("--delete").assert().success();
+
+    assert!(dir.path().join("output/.DS_Store").exists());
+}
+
+#[test]
+fn test_delete_preserves_artifact_directory_with_nested_vcs() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    fs::create_dir_all(dir.path().join("node_modules/package/.git")).unwrap();
+    fs::write(dir.path().join("node_modules/package/source.js"), "source").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(dir.path()).arg("--delete").assert().success();
+
+    assert!(dir.path().join("node_modules/package/source.js").exists());
+    assert!(dir.path().join("node_modules/package/.git").exists());
+}
+
+#[test]
+fn test_vcs_failure_fails_closed() {
+    let dir = tempdir().unwrap();
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join("stale.log"), "log").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(dir.path()).arg("--delete").assert().success();
+
+    assert!(dir.path().join("stale.log").exists());
 }
 
 #[test]

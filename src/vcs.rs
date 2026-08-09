@@ -47,59 +47,76 @@ pub fn detect_vcs(path: &Path) -> (VcsType, Option<PathBuf>) {
 
 /// Check if a path is tracked in git by running git ls-files
 /// Returns VcsCheckResult indicating tracked, untracked, or error
-fn is_tracked_in_git(path: &Path) -> VcsCheckResult {
-    // Find the git repository root
-    let git_root = Command::new("git")
-        .arg("rev-parse")
-        .arg("--show-toplevel")
-        .current_dir(path.parent().unwrap_or(path))
-        .output();
-
-    let git_root = match git_root {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_string()
-        }
-        Ok(_) => {
-            // Git command ran but failed (e.g., not a git repo)
-            return VcsCheckResult::Untracked;
-        }
-        Err(e) => {
-            return VcsCheckResult::Unknown(format!("git rev-parse failed: {}", e));
+fn is_tracked_in_git(path: &Path, git_root: &Path) -> VcsCheckResult {
+    let relative_path = match path.strip_prefix(git_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return VcsCheckResult::Unknown(format!(
+                "{} is outside Git root {}: {}",
+                path.display(),
+                git_root.display(),
+                error
+            ));
         }
     };
 
-    // Check if the file is tracked
     let output = Command::new("git")
         .arg("ls-files")
-        .arg("--error-unmatch")
-        .arg(path)
-        .current_dir(&git_root)
-        .output();
-
-    match output {
-        Ok(output) if output.status.success() => VcsCheckResult::Tracked,
-        Ok(_) => VcsCheckResult::Untracked, // Command ran but file not tracked
-        Err(e) => VcsCheckResult::Unknown(format!("git ls-files failed: {}", e)),
-    }
-}
-
-/// Similar check for jj (Jujutsu)
-/// Returns VcsCheckResult indicating tracked, untracked, or error
-fn is_tracked_in_jj(path: &Path) -> VcsCheckResult {
-    // Check if file is tracked in jj
-    let output = Command::new("jj")
-        .arg("file")
-        .arg("list")
-        .arg(path)
+        .arg("--")
+        .arg(relative_path)
+        .current_dir(git_root)
         .output();
 
     match output {
         Ok(output) if output.status.success() && !output.stdout.is_empty() => {
             VcsCheckResult::Tracked
         }
-        Ok(_) => VcsCheckResult::Untracked,
+        Ok(output) if output.status.success() => VcsCheckResult::Untracked,
+        Ok(output) => VcsCheckResult::Unknown(command_failure("git ls-files", &output)),
+        Err(e) => VcsCheckResult::Unknown(format!("git ls-files failed: {}", e)),
+    }
+}
+
+/// Similar check for jj (Jujutsu)
+/// Returns VcsCheckResult indicating tracked, untracked, or error
+fn is_tracked_in_jj(path: &Path, jj_root: &Path) -> VcsCheckResult {
+    let relative_path = match path.strip_prefix(jj_root) {
+        Ok(path) => path,
+        Err(error) => {
+            return VcsCheckResult::Unknown(format!(
+                "{} is outside Jujutsu root {}: {}",
+                path.display(),
+                jj_root.display(),
+                error
+            ));
+        }
+    };
+
+    let output = Command::new("jj")
+        .arg("file")
+        .arg("list")
+        .arg(relative_path)
+        .current_dir(jj_root)
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            VcsCheckResult::Tracked
+        }
+        Ok(output) if output.status.success() => VcsCheckResult::Untracked,
+        Ok(output) => VcsCheckResult::Unknown(command_failure("jj file list", &output)),
         Err(e) => VcsCheckResult::Unknown(format!("jj file list failed: {}", e)),
     }
+}
+
+fn command_failure(command: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!(
+        "{} exited with {}: {}",
+        command,
+        output.status,
+        stderr.trim()
+    )
 }
 
 /// Check if a path is tracked in version control (git or jj)
@@ -110,18 +127,12 @@ pub fn is_tracked_in_vcs(path: &Path) -> VcsCheckResult {
         return VcsCheckResult::Untracked;
     }
 
-    // Check jj first (since projects using jj also have .git)
-    if path.ancestors().any(|p| p.join(".jj").exists()) {
-        return is_tracked_in_jj(path);
+    match detect_vcs(path) {
+        (VcsType::Jujutsu, Some(root)) => is_tracked_in_jj(path, &root),
+        (VcsType::Git, Some(root)) => is_tracked_in_git(path, &root),
+        (VcsType::None, _) => VcsCheckResult::Untracked,
+        (_, None) => VcsCheckResult::Unknown("VCS root was not found".to_string()),
     }
-
-    // Then check git
-    if path.ancestors().any(|p| p.join(".git").exists()) {
-        return is_tracked_in_git(path);
-    }
-
-    // No VCS found
-    VcsCheckResult::Untracked
 }
 
 /// Spot-check: Does a directory contain ANY tracked files? (for Category 2 directories)
@@ -130,43 +141,32 @@ pub fn is_tracked_in_vcs(path: &Path) -> VcsCheckResult {
 pub fn has_tracked_files(dir: &Path, vcs_type: VcsType, vcs_root: &Path) -> Option<bool> {
     match vcs_type {
         VcsType::Git => {
-            // Use: git ls-files <dir> | head -1
+            let relative_dir = dir.strip_prefix(vcs_root).ok()?;
             let output = Command::new("git")
                 .arg("ls-files")
-                .arg(dir)
+                .arg("--")
+                .arg(relative_dir)
                 .current_dir(vcs_root)
                 .output();
 
             match output {
                 Ok(output) if output.status.success() => Some(!output.stdout.is_empty()),
-                Ok(_) => Some(false), // Command ran but failed (likely empty dir)
-                Err(_) => None,       // Command execution error
+                Ok(_) | Err(_) => None,
             }
         }
         VcsType::Jujutsu => {
-            // Use: jj file list --ignore-working-copy 'glob:"dir/**"' | head -1
-            // Note: --ignore-working-copy is faster (skips snapshot)
-            // Use relative path from VCS root to avoid false positives from directories with same basename
-            let dir_pattern = format!(
-                "glob:\"{}/**\"",
-                dir.strip_prefix(vcs_root)
-                    .ok()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("")
-            );
+            let relative_dir = dir.strip_prefix(vcs_root).ok()?;
 
             let output = Command::new("jj")
                 .arg("file")
                 .arg("list")
-                .arg("--ignore-working-copy")
-                .arg(&dir_pattern)
+                .arg(relative_dir)
                 .current_dir(vcs_root)
                 .output();
 
             match output {
                 Ok(output) if output.status.success() => Some(!output.stdout.is_empty()),
-                Ok(_) => Some(false), // Command ran but no tracked files
-                Err(_) => None,       // Command execution error
+                Ok(_) | Err(_) => None,
             }
         }
         VcsType::None => Some(false),
@@ -184,49 +184,57 @@ pub fn get_tracked_files_batch(
 
     match vcs_type {
         VcsType::Git => {
-            // Use: git ls-files <dir>
+            let relative_dir = dir.strip_prefix(vcs_root).map_err(|error| {
+                format!(
+                    "{} is outside Git root {}: {}",
+                    dir.display(),
+                    vcs_root.display(),
+                    error
+                )
+            })?;
             let output = Command::new("git")
                 .arg("ls-files")
-                .arg(dir)
+                .arg("--")
+                .arg(relative_dir)
                 .current_dir(vcs_root)
                 .output()
                 .map_err(|e| format!("git ls-files failed: {}", e))?;
 
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if !line.is_empty() {
-                        tracked.insert(vcs_root.join(line));
-                    }
+            if !output.status.success() {
+                return Err(command_failure("git ls-files", &output));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if !line.is_empty() {
+                    tracked.insert(vcs_root.join(line));
                 }
             }
-            // Note: Non-success status (e.g., empty dir) is not an error, just no tracked files
         }
         VcsType::Jujutsu => {
-            // Use: jj file list --ignore-working-copy 'glob:"dir/**"'
-            let dir_pattern = format!(
-                "glob:\"{}/**\"",
-                dir.strip_prefix(vcs_root)
-                    .ok()
-                    .and_then(|p| p.to_str())
-                    .unwrap_or("")
-            );
+            let relative_dir = dir.strip_prefix(vcs_root).map_err(|error| {
+                format!(
+                    "{} is outside Jujutsu root {}: {}",
+                    dir.display(),
+                    vcs_root.display(),
+                    error
+                )
+            })?;
 
             let output = Command::new("jj")
                 .arg("file")
                 .arg("list")
-                .arg("--ignore-working-copy")
-                .arg(&dir_pattern)
+                .arg(relative_dir)
                 .current_dir(vcs_root)
                 .output()
                 .map_err(|e| format!("jj file list failed: {}", e))?;
 
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    if !line.is_empty() {
-                        tracked.insert(vcs_root.join(line));
-                    }
+            if !output.status.success() {
+                return Err(command_failure("jj file list", &output));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if !line.is_empty() {
+                    tracked.insert(vcs_root.join(line));
                 }
             }
         }
