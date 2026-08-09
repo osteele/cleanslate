@@ -5,10 +5,12 @@ A command-line tool that recursively examines directories to find and optionally
 ## Features
 
 - Scans directories recursively to identify build artifacts and caches
-- Respects `.gitignore` patterns
+- Preserves files tracked by Git or Jujutsu
 - Detects projects by looking for common project indicators
 - Groups artifacts by project
-- Calculates total size of artifacts
+- Optionally calculates artifact sizes
+- Filters artifacts by age or modification date
+- Excludes selected directories by name
 - Optionally deletes identified artifacts
 - Colorized output
 
@@ -26,7 +28,7 @@ CleanSlate identifies common artifacts from:
 - **C/C++**: `*.o`, `*.so`, `*.dll`, `CMakeFiles`, etc.
 - **Dart/Flutter**: `.dart_tool`, `.pub-cache`
 - **Haskell**: `.stack-work`, `dist-newstyle`
-- **General**: `.DS_Store`, `Thumbs.db`, `tmp`, `logs`, `.idea`, etc.
+- **General**: `tmp`, `logs`, `.idea`, and, in aggressive mode, `.DS_Store` and `Thumbs.db`
 
 ## Pattern Syntax
 
@@ -62,6 +64,8 @@ This ensures that `/build` patterns only match at the actual project root, not i
 
 - **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
 - **VCS Directory Skip**: Never scans inside version control directories (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
+- **Nested Repository Protection**: Skips artifact directories that contain version control metadata
+- **Fail-Closed VCS Checks**: Keeps files when their tracking status cannot be determined
 - **Pattern-Based Selection**: Only removes files matching known artifact patterns (from `artifacts.toml`), leaving untracked source files alone
 - **Symlink Safe**: Never follows or deletes symlinks
 - **Dry Run Mode**: Use `--dry-run` to see what would be deleted without actually deleting
@@ -75,7 +79,7 @@ This ensures that `/build` patterns only match at the actual project root, not i
 ## Installation
 
 ```bash
-cargo install cleanslate
+cargo install --git https://github.com/osteele/cleanslate.git
 ```
 
 Or build from source:
@@ -101,8 +105,17 @@ cleanslate --dry-run
 # Show detailed list format instead of table
 cleanslate --list
 
-# Show verbose output with individual files
-cleanslate -v --files
+# Calculate artifact sizes
+cleanslate --calculate-sizes
+
+# Show diagnostic details while scanning
+cleanslate --verbose
+
+# Exclude directories named vendor
+cleanslate --exclude vendor
+
+# Find artifacts older than two weeks
+cleanslate --older-than 2w
 
 # Delete artifacts
 cleanslate --delete
@@ -115,19 +128,24 @@ cleanslate --delete
 - `-v, --verbose`: Show detailed information about found artifacts
 - `--dry-run`: Show what would be deleted without actually deleting (implies --delete)
 - `-l, --list`: Show detailed list format instead of table (table is default)
+- `--aggressive`: Include small or trivial files such as `.DS_Store`
+- `-x, --exclude <DIR>`: Exclude directories by name; may be repeated
+- `--older-than <DURATION>`: Include artifacts older than a duration such as `48h`, `15d`, `2w`, or `3m`; plain numbers mean days
+- `--modified-before <DATE>`: Include artifacts modified before a date in `YYYY-MM-DD` format
+- `--calculate-sizes`: Calculate artifact sizes by traversing directories
 - `-h, --help`: Print help
 - `-V, --version`: Print version
 
 ## Output Format
 
-By default, cleanslate displays results in a clean table format:
+By default, CleanSlate displays a table with these columns:
 
 - **Path**: Relative path from scan directory
-- **Removable**: Size of artifacts that would be removed (highlighted in bold red if >100 MiB)
-- **Total**: Total project size including all files
-- **What**: List of artifacts to be removed (large items >50 MiB shown in bold, truncated with `...` to fit terminal width)
+- **What**: Artifacts that would be removed
 
-Large projects (>500 MiB total) are highlighted in bold yellow.
+Use `--calculate-sizes` to add a **Removable** column. An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
+
+Use `--list` for a per-project breakdown grouped by language or tool.
 
 ## License
 
