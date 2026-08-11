@@ -1,6 +1,6 @@
 # CleanSlate
 
-A command-line tool that recursively examines directories to find and optionally clean build artifacts and cache files from various programming languages.
+CleanSlate recursively examines directories to find and optionally remove build artifacts and cache files from several programming languages.
 
 ## Features
 
@@ -20,7 +20,7 @@ CleanSlate identifies common artifacts from:
 
 - **Python**: `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.venv`, `*.pyc`, `*.egg-info`, etc.
 - **JavaScript/TypeScript**: `node_modules`, `.next`, `.nuxt`, `.svelte-kit`, `.npm`, `.cache`, etc.
-- **Rust**: `.cargo` cache
+- **Rust**: `/target` (at project root), `.cargo` cache
 - **Go**: `.gocache`, `.gomodcache`, `/vendor` (at project root)
 - **Ruby**: `.bundle`, `vendor/bundle`
 - **Swift/Xcode**: `DerivedData`, `/.build`, `*.xcworkspace/xcuserdata`
@@ -28,16 +28,17 @@ CleanSlate identifies common artifacts from:
 - **C/C++**: `*.o`, `*.so`, `*.dll`, `CMakeFiles`, etc.
 - **Dart/Flutter**: `.dart_tool`, `.pub-cache`
 - **Haskell**: `.stack-work`, `dist-newstyle`
+- **LaTeX/TeX**: `*.aux`, `*.log`, `*.toc`, `*.synctex.gz`, and other compiler output
 - **General**: `tmp`, `logs`, `.idea`, and, in aggressive mode, `.DS_Store` and `Thumbs.db`
 
 ## Pattern Syntax
 
-CleanSlate uses a pattern system defined in `artifacts.toml`. Understanding the pattern syntax helps you know what will be detected:
+CleanSlate loads its artifact patterns from `artifacts.toml`.
 
 ### Pattern Types
 
 1. **Root-level patterns** (with `/` prefix): Only match at project root
-   - Example: `/build` matches `<project-root>/build` but NOT `<project-root>/src/build`
+   - Example: `/build` matches `<project-root>/build` but does not match `<project-root>/src/build`
    - Used for: `/target`, `/dist`, `/out`, `/bin`, `/coverage`, `/vendor`, etc.
 
 2. **Anywhere patterns** (no `/` prefix): Match at any depth
@@ -58,17 +59,17 @@ CleanSlate determines project roots by looking for:
 - `.git` (Git repository)
 - `.jj` (Jujutsu repository)
 
-This ensures that `/build` patterns only match at the actual project root, not in subdirectories.
+Root-scoped patterns such as `/build` match only within directories that contain one of these indicators.
 
 ## Safety Features
 
 - **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
-- **VCS Directory Skip**: Never scans inside version control directories (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
+- **VCS Directory Skip**: Skips version control directories during traversal (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
 - **Nested Repository Protection**: Skips artifact directories that contain version control metadata
 - **Fail-Closed VCS Checks**: Keeps files when their tracking status cannot be determined
-- **Pattern-Based Selection**: Only removes files matching known artifact patterns (from `artifacts.toml`), leaving untracked source files alone
-- **Symlink Safe**: Never follows or deletes symlinks
-- **Dry Run Mode**: Use `--dry-run` to see what would be deleted without actually deleting
+- **Pattern-Based Selection**: Individual files must match a pattern before CleanSlate removes them. A matching recreatable directory is handled as one artifact and removed with all its contents when it has no tracked files.
+- **Symlink Safety**: Traversal does not follow symlinks. CleanSlate skips a symlink encountered as an artifact, but removing an artifact directory also removes symlink entries inside it.
+- **Dry Run Mode**: `--dry-run` previews the deletion set without removing anything
 
 ## Important Notes
 
@@ -130,11 +131,17 @@ cleanslate --delete
 - `-l, --list`: Show detailed list format instead of table (table is default)
 - `--aggressive`: Include small or trivial files such as `.DS_Store`
 - `-x, --exclude <DIR>`: Exclude directories by name; may be repeated
-- `--older-than <DURATION>`: Include artifacts older than a duration such as `48h`, `15d`, `2w`, or `3m`; plain numbers mean days
-- `--modified-before <DATE>`: Include artifacts modified before a date in `YYYY-MM-DD` format
+- `--older-than <DURATION>`: Select artifacts older than a duration such as `48h`, `15d`, `2w`, or `3m`; plain numbers mean days
+- `--modified-before <DATE>`: Select artifacts modified before a date in `YYYY-MM-DD` format
 - `--calculate-sizes`: Calculate artifact sizes by traversing directories
 - `-h, --help`: Print help
 - `-V, --version`: Print version
+
+## Age Filtering
+
+Mixed artifact directories use individual file modification times. Recreatable directories such as `target`, `node_modules`, and `.gomodcache` use the directory's own modification time and are included or excluded as a unit. Changes to a file or nested subdirectory do not necessarily update the top-level directory's modification time.
+
+`--modified-before` interprets its date as midnight in the local time zone. When both time filters are present, an artifact must pass both filters.
 
 ## Output Format
 
@@ -143,9 +150,9 @@ By default, CleanSlate displays a table with these columns:
 - **Path**: Relative path from scan directory
 - **What**: Artifacts that would be removed
 
-Use `--calculate-sizes` to add a **Removable** column. An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
+`--calculate-sizes` adds a **Removable** column. An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
 
-Use `--list` for a per-project breakdown grouped by language or tool.
+`--list` displays a per-project breakdown grouped by language or tool.
 
 ## License
 
