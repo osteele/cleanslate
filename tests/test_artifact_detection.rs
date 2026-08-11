@@ -236,6 +236,8 @@ fn test_is_recreatable_dir_false_positive_check() {
 #[test]
 fn test_is_recreatable_dir_cache_directories() {
     assert!(is_recreatable_dir(Path::new("/path/.cache")));
+    assert!(is_recreatable_dir(Path::new("/path/.gocache")));
+    assert!(is_recreatable_dir(Path::new("/path/.gomodcache")));
     assert!(is_recreatable_dir(Path::new("/path/.pytest_cache")));
     assert!(is_recreatable_dir(Path::new("/path/.mypy_cache")));
     assert!(is_recreatable_dir(Path::new("/path/.ruff_cache")));

@@ -154,6 +154,12 @@ patterns = [
 [go]
 name = "Go"
 
+[go.cache]
+patterns = [
+  ".gocache",
+  ".gomodcache"
+]
+
 [go.dependencies]
 patterns = [
   "/vendor"

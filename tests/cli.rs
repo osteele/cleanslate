@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
 fn setup_test_directory() -> tempfile::TempDir {
@@ -104,6 +106,27 @@ fn test_delete_flag() {
     assert!(!dir.path().join("node_modules").exists());
     assert!(!dir.path().join("__pycache__").exists());
     assert!(!dir.path().join("target").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_delete_read_only_go_module_cache() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("go.mod"), "module example.com/project\n").unwrap();
+
+    let module_dir = dir.path().join(".gomodcache/example.com/dependency@v1.0.0");
+    let nested_dir = module_dir.join("nested");
+    fs::create_dir_all(&nested_dir).unwrap();
+    fs::write(module_dir.join("source.go"), "package dependency\n").unwrap();
+    fs::write(nested_dir.join("timing.log"), "cached output\n").unwrap();
+
+    fs::set_permissions(&nested_dir, fs::Permissions::from_mode(0o555)).unwrap();
+    fs::set_permissions(&module_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(dir.path()).arg("--delete").assert().success();
+
+    assert!(!dir.path().join(".gomodcache").exists());
 }
 
 #[test]

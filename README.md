@@ -21,7 +21,7 @@ CleanSlate identifies common artifacts from:
 - **Python**: `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.venv`, `*.pyc`, `*.egg-info`, etc.
 - **JavaScript/TypeScript**: `node_modules`, `.next`, `.nuxt`, `.svelte-kit`, `.npm`, `.cache`, etc.
 - **Rust**: `.cargo` cache
-- **Go**: `/vendor` (at project root)
+- **Go**: `.gocache`, `.gomodcache`, `/vendor` (at project root)
 - **Ruby**: `.bundle`, `vendor/bundle`
 - **Swift/Xcode**: `DerivedData`, `/.build`, `*.xcworkspace/xcuserdata`
 - **Java/JVM**: `.gradle`, `.m2`, `/classes`

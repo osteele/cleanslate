@@ -96,6 +96,8 @@ pub const RECREATABLE_DIRS: &[&str] = &[
     ".stack-work",
     "dist-newstyle",
     // Go
+    ".gocache",
+    ".gomodcache",
     "vendor",
     // C/C++
     "CMakeFiles",

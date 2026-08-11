@@ -76,7 +76,7 @@ node_modules/new-lib.js (untracked)
 **Why:** These contain version control metadata and must never be touched.
 
 #### Category 2: Recreatable Directories (Spot-Check, Remove if Untracked)
-**Directories:** `node_modules`, `.venv`, `venv`, `env`, `target`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.gradle`, `.m2`, `vendor/bundle`, `.dart_tool`, etc.
+**Directories:** `node_modules`, `.venv`, `venv`, `env`, `target`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.gocache`, `.gomodcache`, `.gradle`, `.m2`, `vendor/bundle`, `.dart_tool`, etc.
 
 **Strategy:** These can be recreated from manifest files (package.json, requirements.txt, Cargo.toml, etc.)
 - Check if directory contains ANY tracked files (single VCS call with early exit)

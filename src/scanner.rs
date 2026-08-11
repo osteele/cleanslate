@@ -14,6 +14,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -95,6 +96,70 @@ fn contains_vcs_checkout(path: &Path) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Make a vetted recreatable directory removable by its owner without following symlinks.
+/// Go module caches make downloaded directories read-only, which prevents remove_dir_all
+/// even though every file in the cache is disposable.
+fn make_tree_removable(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_symlink() {
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        make_directory_removable(path, &metadata)?;
+        for entry in fs::read_dir(path)? {
+            make_tree_removable(&entry?.path())?;
+        }
+    } else {
+        make_file_removable(path, &metadata)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_directory_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = metadata.permissions();
+    let mode = permissions.mode();
+    if mode & 0o700 != 0o700 {
+        permissions.set_mode(mode | 0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_directory_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    make_file_removable(path, metadata)
+}
+
+#[cfg(unix)]
+fn make_file_removable(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_file_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    let mut permissions = metadata.permissions();
+    if permissions.readonly() {
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions)?;
+    }
+    Ok(())
+}
+
+fn remove_recreatable_dir(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            make_tree_removable(path)?;
+            fs::remove_dir_all(path)
+        }
+        result => result,
+    }
 }
 
 /// Check if a path should be excluded based on directory name matching
@@ -275,7 +340,7 @@ fn handle_directory_artifact(
         // Remove entire directory if in delete mode AND passes time filter
         let should_remove = passes_time_filter && (options.delete || options.dry_run);
         let removed = if should_remove && options.delete && !options.dry_run {
-            match fs::remove_dir_all(path) {
+            match remove_recreatable_dir(path) {
                 Ok(_) => {
                     if options.verbose {
                         println!("Removed directory: {}", path.display());
