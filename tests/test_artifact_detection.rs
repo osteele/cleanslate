@@ -187,6 +187,28 @@ fn test_truncate_name_with_multibyte_characters() {
     assert_eq!(truncate_name_with_suffix("缓存目录名", 4), "缓...");
 }
 
+#[test]
+fn test_root_scoped_pattern_matches_with_new_project_indicator() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cleanslate_pom_test");
+    fs::remove_dir_all(&temp_dir).ok();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    fs::write(temp_dir.join("pom.xml"), "<project></project>").unwrap();
+    fs::create_dir_all(temp_dir.join("build")).unwrap();
+    fs::write(temp_dir.join("build/output.class"), "bytes").unwrap();
+
+    let patterns = get_artifact_patterns(false).expect("Failed to load patterns");
+    assert!(
+        is_artifact(temp_dir.join("build").as_path(), &patterns),
+        "/build should match at project root identified by pom.xml"
+    );
+
+    fs::remove_dir_all(&temp_dir).ok();
+}
+
 // ============ is_recreatable_dir tests ============
 
 #[test]

@@ -4,10 +4,7 @@ use crate::patterns::{
     is_project_root, is_recreatable_dir, matching_pattern, ArtifactPattern, ArtifactType,
 };
 use crate::time::TimeFilter;
-use crate::vcs::{
-    detect_vcs, get_tracked_files_batch, has_tracked_files, is_tracked_in_vcs, VcsCheckResult,
-    VCS_INTERNALS,
-};
+use crate::vcs::{detect_vcs, get_tracked_files_batch, VcsMetrics, VcsType, VCS_INTERNALS};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Sender};
@@ -36,6 +33,8 @@ pub struct ScanStats {
     pub excluded_by_time: usize,
     /// Paths skipped because their VCS tracking status could not be determined
     pub vcs_check_failures: usize,
+    /// Number of batch VCS calls issued during the scan.
+    pub vcs_batch_call_count: usize,
 }
 
 /// Context for time-based filtering, including the filter and scan statistics
@@ -138,15 +137,6 @@ pub fn should_exclude_path(path: &Path, excludes: &[String]) -> bool {
 
 /// Find the project root for a given path
 pub fn find_project_root(path: &Path) -> Option<PathBuf> {
-    let indicators = [
-        "Cargo.toml",     // Rust
-        "pyproject.toml", // Python
-        "package.json",   // JavaScript/Node
-        "go.mod",         // Go
-        ".git",           // Generic project indicator
-        ".jj",            // Jujutsu VCS
-    ];
-
     // Start from the parent if path is a file
     let mut current = if path.is_file() {
         path.parent()
@@ -155,10 +145,8 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     };
 
     while let Some(p) = current {
-        for indicator in &indicators {
-            if p.join(indicator).exists() {
-                return Some(p.to_path_buf());
-            }
+        if crate::patterns::is_project_root(p) {
+            return Some(p.to_path_buf());
         }
 
         current = p.parent();
@@ -173,43 +161,55 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// VCS state for a single project, computed once before traversal.
+enum ProjectVcsState {
+    /// No VCS detected; all artifacts are treated as untracked.
+    NoVcs,
+    /// VCS detected and the full tracked-file set was fetched successfully.
+    Tracked { tracked_files: HashSet<PathBuf> },
+    /// The project-level VCS call failed; every artifact must be skipped to be safe.
+    Failed { message: String },
+}
+
+/// Values invariant for the duration of a single project's scan.
+struct ArtifactScan<'a> {
+    project_root: &'a Path,
+    skip_paths: &'a Arc<Mutex<HashSet<PathBuf>>>,
+    options: ScanOptions,
+    vcs_state: &'a ProjectVcsState,
+}
+
 /// Handle a directory artifact (Category 2 or Category 3)
 fn handle_directory_artifact(
     path: &Path,
-    project_root: &Path,
     pattern: &ArtifactPattern,
     projects: &mut HashMap<PathBuf, ProjectReport>,
-    skip_paths: &Arc<Mutex<HashSet<PathBuf>>>,
-    options: ScanOptions,
     time_ctx: &mut TimeFilterContext,
+    scan: &ArtifactScan,
 ) -> Result<u64> {
     let mut total_bytes = 0u64;
 
-    // Detect VCS type once for this directory
-    let (vcs_type, vcs_root) = detect_vcs(path);
-    let vcs_root = vcs_root.unwrap_or_else(|| project_root.to_path_buf());
-
     match contains_vcs_checkout(path) {
         Ok(true) => {
-            if options.verbose {
+            if scan.options.verbose {
                 println!(
                     "Directory contains nested version-control metadata, skipping: {}",
                     path.display()
                 );
             }
-            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
             return Ok(0);
         }
         Err(error) => {
             time_ctx.stats.vcs_check_failures += 1;
-            if options.verbose {
+            if scan.options.verbose {
                 eprintln!(
                     "Warning: Could not inspect {} for nested repositories: {}, skipping to be safe",
                     path.display(),
                     error
                 );
             }
-            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
             return Ok(0);
         }
         Ok(false) => {}
@@ -217,7 +217,7 @@ fn handle_directory_artifact(
 
     // Category 2: Recreatable directories (spot-check)
     if is_recreatable_dir(path) {
-        if options.verbose {
+        if scan.options.verbose {
             println!(
                 "DEBUG: Spot-checking Category 2 directory: {}",
                 path.display()
@@ -225,29 +225,31 @@ fn handle_directory_artifact(
         }
 
         // Spot-check: Does this directory contain ANY tracked files?
-        match has_tracked_files(path, vcs_type, &vcs_root) {
-            Some(true) => {
-                if options.verbose {
-                    println!("  Contains tracked files, skipping");
-                }
-                skip_paths.lock().unwrap().insert(path.to_path_buf());
-                return Ok(0);
-            }
-            None => {
+        let has_tracked = match scan.vcs_state {
+            ProjectVcsState::Failed { .. } => {
                 // VCS check failed - skip removal to be safe
                 time_ctx.stats.vcs_check_failures += 1;
-                if options.verbose {
+                if scan.options.verbose {
                     eprintln!(
                         "Warning: VCS check failed for {}, skipping to be safe",
                         path.display()
                     );
                 }
-                skip_paths.lock().unwrap().insert(path.to_path_buf());
+                scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
                 return Ok(0);
             }
-            Some(false) => {
-                // No tracked files, continue with removal
+            ProjectVcsState::NoVcs => false,
+            ProjectVcsState::Tracked { tracked_files, .. } => {
+                tracked_files.iter().any(|f| f.starts_with(path))
             }
+        };
+
+        if has_tracked {
+            if scan.options.verbose {
+                println!("  Contains tracked files, skipping");
+            }
+            scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
+            return Ok(0);
         }
 
         // Check time filter for directories (using directory's own modification time)
@@ -271,14 +273,14 @@ fn handle_directory_artifact(
             time_ctx.stats.passed_time_filter += 1;
         } else {
             time_ctx.stats.excluded_by_time += 1;
-            if options.verbose {
+            if scan.options.verbose {
                 println!("Directory filtered by time: {}", path.display());
             }
         }
 
         // No tracked files → entire directory can be removed
         // Skip size calculation unless explicitly requested
-        let dir_size = if options.calculate_sizes {
+        let dir_size = if scan.options.calculate_sizes {
             calculate_total_dir_size(path)
         } else {
             0 // Size not calculated
@@ -290,7 +292,7 @@ fn handle_directory_artifact(
         }
 
         let project_report = projects
-            .entry(project_root.to_path_buf())
+            .entry(scan.project_root.to_path_buf())
             .or_insert_with(|| ProjectReport {
                 artifacts: Vec::new(),
             });
@@ -310,37 +312,40 @@ fn handle_directory_artifact(
             files: Vec::new(),
         });
 
-        skip_paths.lock().unwrap().insert(path.to_path_buf());
+        scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
         return Ok(total_bytes);
     }
 
     // Category 3: Other directories (batch-check contents)
-    if options.verbose {
+    if scan.options.verbose {
         println!(
             "DEBUG: Batch-checking Category 3 directory: {}",
             path.display()
         );
     }
 
-    // Get all tracked files in this directory with a single VCS call
-    let tracked_files = match get_tracked_files_batch(path, vcs_type, &vcs_root) {
-        Ok(files) => files,
-        Err(e) => {
-            // VCS check failed - skip this directory to be safe
+    // Get all tracked files in this directory from the cached project set.
+    let tracked_files: HashSet<PathBuf> = match scan.vcs_state {
+        ProjectVcsState::Failed { .. } => {
             time_ctx.stats.vcs_check_failures += 1;
-            if options.verbose {
+            if scan.options.verbose {
                 eprintln!(
-                    "Warning: VCS check failed for {}: {}, skipping to be safe",
-                    path.display(),
-                    e
+                    "Warning: VCS check failed for {}, skipping to be safe",
+                    path.display()
                 );
             }
-            skip_paths.lock().unwrap().insert(path.to_path_buf());
+            scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
             return Ok(0);
         }
+        ProjectVcsState::NoVcs => HashSet::new(),
+        ProjectVcsState::Tracked { tracked_files, .. } => tracked_files
+            .iter()
+            .filter(|f| f.starts_with(path))
+            .cloned()
+            .collect(),
     };
 
-    if options.verbose {
+    if scan.options.verbose {
         println!("  Found {} tracked files", tracked_files.len());
     }
 
@@ -378,14 +383,14 @@ fn handle_directory_artifact(
                 time_ctx.stats.passed_time_filter += 1;
             } else {
                 time_ctx.stats.excluded_by_time += 1;
-                if options.verbose {
+                if scan.options.verbose {
                     println!("File filtered by time: {}", file_path.display());
                 }
             }
 
             // Only add to removal list if it passes time filter
             if file_passes_time_filter {
-                let file_size = if options.calculate_sizes {
+                let file_size = if scan.options.calculate_sizes {
                     // Use symlink_metadata to avoid following symlinks (same as Python's lstat)
                     if let Ok(meta) = fs::symlink_metadata(file_path) {
                         let size = meta.len();
@@ -408,7 +413,7 @@ fn handle_directory_artifact(
         total_bytes += dir_total_size;
 
         let project_report = projects
-            .entry(project_root.to_path_buf())
+            .entry(scan.project_root.to_path_buf())
             .or_insert_with(|| ProjectReport {
                 artifacts: Vec::new(),
             });
@@ -432,7 +437,7 @@ fn handle_directory_artifact(
         });
     }
 
-    skip_paths.lock().unwrap().insert(path.to_path_buf());
+    scan.skip_paths.lock().unwrap().insert(path.to_path_buf());
     Ok(total_bytes)
 }
 
@@ -440,34 +445,33 @@ fn handle_directory_artifact(
 fn handle_file_artifact(
     path: &Path,
     metadata: &fs::Metadata,
-    project_root: &Path,
     pattern: &ArtifactPattern,
     projects: &mut HashMap<PathBuf, ProjectReport>,
-    options: ScanOptions,
     time_ctx: &mut TimeFilterContext,
+    scan: &ArtifactScan,
 ) -> Result<u64> {
-    // For files: check if tracked in version control
-    match is_tracked_in_vcs(path) {
-        VcsCheckResult::Tracked => {
-            if options.verbose {
-                println!("Skipping tracked file: {}", path.display());
-            }
-            return Ok(0);
-        }
-        VcsCheckResult::Unknown(e) => {
+    // For files: check if tracked in version control using the cached project set.
+    match scan.vcs_state {
+        ProjectVcsState::Failed { message } => {
             // VCS check failed - skip removal to be safe
             time_ctx.stats.vcs_check_failures += 1;
-            if options.verbose {
+            if scan.options.verbose {
                 eprintln!(
                     "Warning: VCS check failed for {}: {}, skipping to be safe",
                     path.display(),
-                    e
+                    message
                 );
             }
             return Ok(0);
         }
-        VcsCheckResult::Untracked => {
-            // Continue with removal
+        ProjectVcsState::Tracked { tracked_files, .. } if tracked_files.contains(path) => {
+            if scan.options.verbose {
+                println!("Skipping tracked file: {}", path.display());
+            }
+            return Ok(0);
+        }
+        ProjectVcsState::NoVcs | ProjectVcsState::Tracked { .. } => {
+            // Untracked: continue with removal
         }
     }
 
@@ -482,7 +486,7 @@ fn handle_file_artifact(
         if let Some(mtime) = modified_time {
             time_ctx.filter.passes(mtime)
         } else {
-            if options.verbose {
+            if scan.options.verbose {
                 println!(
                     "Warning: Could not get modification time for {}",
                     path.display()
@@ -498,7 +502,7 @@ fn handle_file_artifact(
         time_ctx.stats.passed_time_filter += 1;
     } else {
         time_ctx.stats.excluded_by_time += 1;
-        if options.verbose {
+        if scan.options.verbose {
             println!("File filtered by time: {}", path.display());
         }
     }
@@ -506,7 +510,7 @@ fn handle_file_artifact(
     let size = metadata.len();
 
     let project_report = projects
-        .entry(project_root.to_path_buf())
+        .entry(scan.project_root.to_path_buf())
         .or_insert_with(|| ProjectReport {
             artifacts: Vec::new(),
         });
@@ -667,6 +671,27 @@ fn scan_project_for_artifacts(
     // Canonicalize the project root
     let project_root = project_root.canonicalize().unwrap_or(project_root);
 
+    // Detect VCS once for the project and fetch the full tracked-file set once.
+    let metrics = VcsMetrics::new();
+    let (vcs_type, vcs_root) = detect_vcs(&project_root);
+    let vcs_root = vcs_root.unwrap_or_else(|| project_root.to_path_buf());
+    let vcs_state: ProjectVcsState = if vcs_type == VcsType::None {
+        ProjectVcsState::NoVcs
+    } else {
+        match get_tracked_files_batch(&project_root, vcs_type, &vcs_root, &metrics) {
+            Ok(tracked_files) => ProjectVcsState::Tracked { tracked_files },
+            Err(message) => ProjectVcsState::Failed { message },
+        }
+    };
+    stats.vcs_batch_call_count = metrics.batch_call_count();
+
+    let scan = ArtifactScan {
+        project_root: &project_root,
+        skip_paths: &skip_paths,
+        options,
+        vcs_state: &vcs_state,
+    };
+
     let exclude_clone = exclude.to_vec();
 
     let walker = WalkBuilder::new(&project_root)
@@ -753,25 +778,17 @@ fn scan_project_for_artifacts(
                 stats: &mut stats,
             };
             if metadata.is_dir() {
-                let bytes = handle_directory_artifact(
-                    path,
-                    &project_root,
-                    pattern,
-                    &mut projects,
-                    &skip_paths,
-                    options,
-                    &mut time_ctx,
-                )?;
+                let bytes =
+                    handle_directory_artifact(path, pattern, &mut projects, &mut time_ctx, &scan)?;
                 total_bytes += bytes;
             } else {
                 let bytes = handle_file_artifact(
                     path,
                     &metadata,
-                    &project_root,
                     pattern,
                     &mut projects,
-                    options,
                     &mut time_ctx,
+                    &scan,
                 )?;
                 total_bytes += bytes;
             }
@@ -855,6 +872,7 @@ pub fn scan_single_path(
         stats.passed_time_filter += result.stats.passed_time_filter;
         stats.excluded_by_time += result.stats.excluded_by_time;
         stats.vcs_check_failures += result.stats.vcs_check_failures;
+        stats.vcs_batch_call_count += result.stats.vcs_batch_call_count;
 
         for (project_path, project_report) in result.projects {
             projects

@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// VCS internal directories that should never be traversed or removed.
 /// See docs/architecture.md for detailed explanation of the three directory categories.
@@ -16,6 +18,28 @@ pub enum VcsType {
     Git,
     Jujutsu,
     None,
+}
+
+/// Optional metrics for VCS operations.
+/// In test builds this tracks how many batch VCS calls are issued so callers
+/// can assert the subprocess count is O(1) per project.
+#[derive(Default, Clone)]
+pub struct VcsMetrics {
+    batch_call_count: Arc<AtomicUsize>,
+}
+
+impl VcsMetrics {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn batch_call_count(&self) -> usize {
+        self.batch_call_count.load(Ordering::SeqCst)
+    }
+
+    fn record_batch_call(&self) {
+        self.batch_call_count.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// Result of a VCS tracking check
@@ -179,7 +203,10 @@ pub fn get_tracked_files_batch(
     dir: &Path,
     vcs_type: VcsType,
     vcs_root: &Path,
+    metrics: &VcsMetrics,
 ) -> Result<HashSet<PathBuf>, String> {
+    metrics.record_batch_call();
+
     let mut tracked = HashSet::new();
 
     match vcs_type {
@@ -192,6 +219,13 @@ pub fn get_tracked_files_batch(
                     error
                 )
             })?;
+            // When the directory is the repository root, strip_prefix returns an empty
+            // path; git requires "." to mean "the whole repository".
+            let relative_dir = if relative_dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative_dir
+            };
             let output = Command::new("git")
                 .arg("ls-files")
                 .arg("--")
@@ -219,6 +253,13 @@ pub fn get_tracked_files_batch(
                     error
                 )
             })?;
+            // When the directory is the repository root, strip_prefix returns an empty
+            // path; jj requires "." to mean "the whole repository".
+            let relative_dir = if relative_dir.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                relative_dir
+            };
 
             let output = Command::new("jj")
                 .arg("file")

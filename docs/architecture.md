@@ -71,7 +71,7 @@ node_modules/new-lib.js (untracked)
 
 **Strategy:** Skip during traversal entirely. These are never removable.
 
-**Code location:** `src/main.rs:497-510`, `src/main.rs:581`
+**Code location:** `src/scanner.rs` (filter_entry during project discovery and per-project walk), `src/vcs.rs` (`VCS_INTERNALS` constant)
 
 **Why:** These contain version control metadata and must never be touched.
 
@@ -85,7 +85,7 @@ node_modules/new-lib.js (untracked)
 
 **Performance:** 1 VCS call vs N calls for N files (10,000x+ speedup for large directories)
 
-**Code location:** `src/main.rs:~60` (directory list), `src/main.rs:~600-663` (handling logic)
+**Code location:** `src/patterns.rs` (`RECREATABLE_DIRS`), `src/scanner.rs` (`handle_directory_artifact` Category 2 logic)
 
 **Why this works:** These directories are conventionally never tracked, so the spot-check almost always finds no tracked files and we can skip the expensive traversal.
 
@@ -99,7 +99,7 @@ node_modules/new-lib.js (untracked)
 
 **Performance:** 1 VCS call per directory vs N calls for N files
 
-**Code location:** `src/main.rs:~600-700`
+**Code location:** `src/scanner.rs` (`handle_directory_artifact` Category 3 logic)
 
 **Why this is needed:** Custom project directories may contain a mix of artifacts and source files, so we need file-level granularity.
 
@@ -164,51 +164,66 @@ The `ignore` crate (used via `WalkBuilder`) **is intentionally disabled** (`.git
 
 ## VCS Checking Strategy
 
-### Why Spot-Check Works for Category 2
+### One Batch Call Per Project
 
-Since git/jj only track files, checking if a directory is "untracked" means:
+For every discovered project root, CleanSlate detects the VCS **once** and fetches the project's complete tracked-file set with a single subprocess call:
+
 ```bash
-# If this returns nothing, directory has no tracked files
-git ls-files node_modules | head -1
-jj file list 'node_modules' | head -1
+# Fetch every tracked file under the project root
+git ls-files .
+jj file list .
 ```
 
-This avoids traversing 10,000+ files when we only need a yes/no answer.
+This set is cached in memory and reused for the rest of the scan. Both file artifacts and directory artifacts check tracking status via O(1) HashSet lookups, so the subprocess count is independent of the number of artifacts.
 
-**Key insight:** For conventionally-untracked directories like `node_modules`, this check almost always returns nothing immediately, giving us a 10,000x speedup.
+### Why Spot-Check Still Works for Category 2
+
+Since git/jj only track files, checking if a directory is "untracked" means asking whether the cached tracked-file set contains any path starting with that directory:
+
+```bash
+# Equivalent to the old single-purpose check, but answered from the cached set
+git ls-files node_modules | head -1
+```
+
+This avoids traversing 10,000+ files when we only need a yes/no answer, while sharing the same project-level call used everywhere else.
 
 ### Batch Checking for Category 3
 
-For other directories, we need file-level granularity:
+For mixed directories, the cached project-wide set is filtered to the directory being inspected:
+
 ```bash
-# Get all tracked files in one call
+# Conceptually equivalent to:
 git ls-files some-directory
-jj file list --ignore-working-copy 'glob:"some-directory/**"'
 ```
 
-Then check each file against this cached set (O(1) lookup).
+Then each file is checked against the filtered set with an O(1) HashSet lookup.
 
 ### VCS Detection Priority
 
 When both `.jj` and `.git` are present:
 1. **Prefer Jujutsu** (`.jj` takes precedence)
-2. Use `jj file list --ignore-working-copy` (faster, skips snapshot)
+2. Use `jj file list` (faster, skips snapshot)
 3. Fall back to Git only if `.jj` not found
 
-**Why prefer jj:** Per user configuration in `.claude/CLAUDE.md`, when both exist, use jj.
+**Why prefer jj:** A colocated repository has both directories, but `jj` is the working front end there, and its file list reflects the working copy that the user actually edits through.
+
+### Fail-Closed Behavior
+
+If the single project-level VCS call fails (for example, a corrupted `.git` directory), every artifact in that project is treated as having unknown tracking status and is **kept**. The count of skipped artifacts is reported in `vcs_check_failures`, matching the previous per-artifact counting semantics. This preserves the safety-critical property that CleanSlate must never remove a file whose tracking status cannot be determined.
 
 ## Performance Impact
 
 ### Before Optimization
 - **O(N) subprocess calls** where N = total files in artifact directories
-- Example: `node_modules` with 10,000 files = 10,000 subprocess calls
-- Result: **Hangs for minutes or hours**
+- Example: a project with 100 loose `*.aux` files = 100 subprocess calls
+- Result: **Hangs for minutes or hours on large projects**
 
 ### After Optimization
 - **Category 1:** O(0) - skipped during traversal
-- **Category 2:** O(1) subprocess call per directory (spot-check with early exit)
-- **Category 3:** O(1) subprocess call per directory (batch check)
-- Example: `node_modules` with 10,000 files = 1 subprocess call
+- **Category 2:** O(1) subprocess call per project (spot-check answered from the cached tracked-file set)
+- **Category 3:** O(1) subprocess call per project (batch fetch answered once and filtered per directory)
+- **File artifacts:** O(1) subprocess call per project (HashSet lookup per file)
+- Example: a project with 100 loose `*.aux` files = 1 subprocess call
 - Result: **Completes in seconds**
 
 ### Expected Speedup
@@ -226,7 +241,7 @@ After removing files, directories may become empty. The cleanup pass:
 
 **Why this matters:** Removing files from `src/build/output/file.o` should also remove the empty `output/` and `build/` directories if they become empty.
 
-**Code location:** `src/main.rs:~720-795`
+**Code location:** `src/execute.rs` (`cleanup_empty_directories`)
 
 ## Time-Based Filtering Strategy
 
@@ -305,4 +320,4 @@ The directory mtime does NOT update when:
 
 For Category 2 artifacts, this is usually acceptable since installing/updating dependencies (the primary use case) modifies the directory structure.
 
-**Code location:** `src/main.rs:~963-989` (directory-level), `src/main.rs:~1087-1100` (per-file)
+**Code location:** `src/scanner.rs` (`handle_directory_artifact` directory-level and per-file mtime checks)

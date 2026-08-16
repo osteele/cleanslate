@@ -5,6 +5,27 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
+/// Files and directories that identify a directory as a project root.
+/// Used by pattern matching to decide whether root-scoped patterns (e.g., `/build`)
+/// apply and by project discovery to stop descending into subprojects.
+pub const PROJECT_ROOT_INDICATORS: &[&str] = &[
+    "Cargo.toml",       // Rust
+    "pyproject.toml",   // Python
+    "package.json",     // JavaScript/Node
+    "go.mod",           // Go
+    "Gemfile",          // Ruby
+    "pom.xml",          // Java/Maven
+    "build.gradle",     // Java/Gradle
+    "build.gradle.kts", // Java/Gradle Kotlin DSL
+    "CMakeLists.txt",   // C/C++ CMake
+    "pubspec.yaml",     // Dart/Flutter
+    "Package.swift",    // Swift
+    "composer.json",    // PHP
+    "mix.exs",          // Elixir
+    ".git",             // Generic project indicator
+    ".jj",              // Jujutsu VCS
+];
+
 /// Define artifact types for better classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -16,6 +37,15 @@ pub enum ArtifactType {
     Logs,         // Log files
     Intermediate, // Intermediate files (*.pyc, etc.)
     IDE,          // IDE files (.vscode, .idea, etc.)
+}
+
+/// A precompiled matcher for an artifact pattern.
+#[derive(Debug, Clone)]
+pub enum PatternMatcher {
+    /// Matches only the file or directory name at any depth (e.g., `*.pyc`, `node_modules`).
+    Filename(globset::GlobMatcher),
+    /// Matches a suffix of the full path (e.g., `vendor/bundle`, `*.xcworkspace/xcuserdata`).
+    PathSuffix(globset::GlobMatcher),
 }
 
 /// Structure to hold artifact pattern and its type
@@ -30,6 +60,8 @@ pub struct ArtifactPattern {
     pub language_name: String,
     /// Whether this pattern should only be used in aggressive mode
     pub aggressive: bool,
+    /// Precompiled glob matcher for this pattern.
+    pub matcher: PatternMatcher,
 }
 
 /// Structure to deserialize artifact patterns from TOML
@@ -55,6 +87,31 @@ struct PatternConfig {
 
 // Embed the TOML file directly in the binary at compile time
 const ARTIFACTS_TOML: &str = include_str!("../artifacts.toml");
+
+/// Compile a single artifact pattern into a matcher.
+///
+/// - Root-scoped patterns (`needs_context == true`) are matched against the file/directory
+///   name; the caller must verify the parent directory is a project root.
+/// - Multi-component patterns are matched against the suffix of the full path.
+/// - Single-component patterns are matched against the file/directory name only.
+fn compile_pattern(pattern: &str, needs_context: bool) -> Result<PatternMatcher> {
+    if needs_context {
+        // Root-scoped patterns currently are all single-component names.
+        let glob = globset::Glob::new(pattern)
+            .with_context(|| format!("Invalid root-scoped artifact pattern: {}", pattern))?;
+        Ok(PatternMatcher::Filename(glob.compile_matcher()))
+    } else if pattern.contains('/') {
+        // Multi-component pattern: match as a path suffix.
+        let glob = globset::Glob::new(&format!("**/{}", pattern))
+            .with_context(|| format!("Invalid multi-component artifact pattern: {}", pattern))?;
+        Ok(PatternMatcher::PathSuffix(glob.compile_matcher()))
+    } else {
+        // Single-component pattern: match only the file/directory name at any depth.
+        let glob = globset::Glob::new(pattern)
+            .with_context(|| format!("Invalid artifact pattern: {}", pattern))?;
+        Ok(PatternMatcher::Filename(glob.compile_matcher()))
+    }
+}
 
 /// Directories that are conventionally recreatable from manifest files and rarely tracked.
 /// These directories can be spot-checked for tracking (single VCS call) rather than
@@ -115,8 +172,9 @@ pub fn is_recreatable_dir(path: &Path) -> bool {
 
     for pattern in RECREATABLE_DIRS {
         if pattern.contains('/') {
-            // Multi-component pattern like "vendor/bundle"
-            if matches_path_suffix(path, pattern) {
+            // Multi-component pattern like "vendor/bundle": match the path suffix by
+            // components so that an ancestor named "avendor" does not accidentally match.
+            if path.ends_with(pattern) {
                 return true;
             }
         } else if *pattern == dir_name {
@@ -176,12 +234,15 @@ fn get_artifact_patterns_from_toml() -> Result<Vec<ArtifactPattern>> {
                     pattern
                 };
 
+                let matcher = compile_pattern(&pattern_normalized, needs_context)?;
+
                 patterns.push(ArtifactPattern {
                     pattern: pattern_normalized,
                     artifact_type,
                     needs_context,
                     language_name: lang_config.name.clone(),
                     aggressive: pattern_config.aggressive,
+                    matcher,
                 });
             }
         }
@@ -215,56 +276,31 @@ pub fn matching_pattern<'a>(
     path: &Path,
     patterns: &'a [ArtifactPattern],
 ) -> Option<&'a ArtifactPattern> {
-    let filename = path
-        .file_name()
-        .map(|f| f.to_string_lossy())
-        .unwrap_or_default();
+    let filename = path.file_name()?;
 
-    // Now apply whitelist pattern matching - ONLY match known artifact patterns
     for pattern in patterns {
-        // Handle patterns that need context (starting with /)
-        if pattern.needs_context {
-            // For root-scoped patterns, we need to check if the filename matches
-            // and if the parent directory is a project root
-            if filename == pattern.pattern {
-                // Check if parent is a project root
-                if let Some(parent) = path.parent() {
-                    if is_project_root(parent) {
+        match &pattern.matcher {
+            PatternMatcher::Filename(matcher) => {
+                // Match against the candidate's own file/directory name only; ancestors
+                // coincidentally named "tmp", "env", etc. must not cause a match.
+                if matcher.is_match(Path::new(filename)) {
+                    if pattern.needs_context {
+                        // Root-scoped patterns require the parent directory to be a project root.
+                        if let Some(parent) = path.parent() {
+                            if is_project_root(parent) {
+                                return Some(pattern);
+                            }
+                        }
+                    } else {
                         return Some(pattern);
                     }
                 }
             }
-            continue;
-        }
-
-        // Check if pattern contains a slash (multi-component pattern)
-        if pattern.pattern.contains('/') {
-            // Multi-component pattern like "vendor/bundle" or "*.xcworkspace/xcuserdata"
-            if matches_path_suffix(path, &pattern.pattern) {
-                return Some(pattern);
-            }
-            continue;
-        }
-
-        // Single-component patterns - check different pattern types
-        if let Some(suffix) = pattern.pattern.strip_prefix('*') {
-            // Match against filename for suffix patterns (e.g., *.pyc)
-            if filename.ends_with(suffix) {
-                return Some(pattern);
-            }
-        } else if pattern.pattern.contains('*') {
-            // Handle glob patterns - match against filename only
-            let parts: Vec<&str> = pattern.pattern.split('*').collect();
-            if parts.len() == 2 {
-                let filename_str = filename.to_string();
-                if filename_str.starts_with(parts[0]) && filename_str.ends_with(parts[1]) {
+            PatternMatcher::PathSuffix(matcher) => {
+                if matcher.is_match(path) {
                     return Some(pattern);
                 }
             }
-        } else if filename == pattern.pattern {
-            // Exact names match at any traversal depth. Only inspect the candidate's
-            // filename: absolute ancestors may coincidentally be named "tmp", "env", etc.
-            return Some(pattern);
         }
     }
 
@@ -278,92 +314,102 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
     matching_pattern(path, patterns).is_some()
 }
 
-/// Helper function to match multi-component patterns against path suffixes
-/// Supports wildcards like "*.xcworkspace/xcuserdata" and literals like "vendor/bundle"
-fn matches_path_suffix(path: &Path, pattern: &str) -> bool {
-    // Split the pattern into components
-    let pattern_parts: Vec<&str> = pattern.split('/').collect();
-
-    // Get path components from the end
-    let path_components: Vec<_> = path
-        .components()
-        .filter_map(|c| {
-            if let std::path::Component::Normal(os_str) = c {
-                Some(os_str.to_string_lossy().to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // Check if we have enough components to match
-    if path_components.len() < pattern_parts.len() {
-        return false;
-    }
-
-    // Match from the end of the path
-    let start_idx = path_components.len() - pattern_parts.len();
-    for (i, pattern_part) in pattern_parts.iter().enumerate() {
-        let path_component = &path_components[start_idx + i];
-
-        if !matches_component(path_component, pattern_part) {
-            return false;
-        }
-    }
-
-    true
-}
-
-/// Helper function to match a single path component against a pattern with wildcards
-fn matches_component(component: &str, pattern: &str) -> bool {
-    if pattern == component {
-        // Exact match
-        return true;
-    }
-
-    if !pattern.contains('*') && !pattern.contains('?') {
-        // No wildcards, already checked exact match above
-        return false;
-    }
-
-    // Handle wildcards
-    if let Some(suffix) = pattern.strip_prefix('*') {
-        // Simple suffix match like "*.xcworkspace"
-        return component.ends_with(suffix);
-    }
-
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        // Simple prefix match like "cmake-build-*"
-        return component.starts_with(prefix);
-    }
-
-    // Complex glob pattern - split on * and match parts
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 2 {
-        return component.starts_with(parts[0]) && component.ends_with(parts[1]);
-    }
-
-    // For more complex patterns, we'd need a full glob matcher
-    // For now, return false for patterns we can't handle
-    false
-}
-
 /// Helper function to check if a path is a project root
 pub fn is_project_root(path: &Path) -> bool {
-    let indicators = [
-        "Cargo.toml",     // Rust
-        "pyproject.toml", // Python
-        "package.json",   // JavaScript/Node
-        "go.mod",         // Go
-        ".git",           // Generic project indicator
-        ".jj",            // Jujutsu VCS
-    ];
+    PROJECT_ROOT_INDICATORS
+        .iter()
+        .any(|indicator| path.join(indicator).exists())
+}
 
-    for indicator in &indicators {
-        if path.join(indicator).exists() {
-            return true;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pattern(raw: &str) -> ArtifactPattern {
+        let needs_context = raw.starts_with('/');
+        let normalized = if needs_context {
+            raw.strip_prefix('/').unwrap_or(raw).to_string()
+        } else {
+            raw.to_string()
+        };
+        ArtifactPattern {
+            pattern: normalized.clone(),
+            artifact_type: ArtifactType::Temp,
+            needs_context,
+            language_name: "Test".to_string(),
+            aggressive: false,
+            matcher: compile_pattern(&normalized, needs_context).unwrap(),
         }
     }
 
-    false
+    #[test]
+    fn multi_star_pattern_matches() {
+        let patterns = vec![make_pattern("cmake-build-*-debug")];
+        assert!(is_artifact(
+            Path::new("/project/cmake-build-x86_64-debug"),
+            &patterns
+        ));
+        assert!(!is_artifact(
+            Path::new("/project/cmake-build-debug"),
+            &patterns
+        ));
+        assert!(!is_artifact(
+            Path::new("/project/cmake-build-x86_64-release"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn multi_star_suffix_pattern_matches() {
+        let patterns = vec![make_pattern("*.tmp.*")];
+        assert!(is_artifact(Path::new("/project/file.tmp.txt"), &patterns));
+        assert!(is_artifact(Path::new("/project/archive.tmp.gz"), &patterns));
+        assert!(!is_artifact(Path::new("/project/file.tmp"), &patterns));
+        assert!(!is_artifact(Path::new("/project/file.txt"), &patterns));
+    }
+
+    #[test]
+    fn filename_only_does_not_match_ancestor_dirs() {
+        let patterns = vec![make_pattern("tmp"), make_pattern("*.pyc")];
+        assert!(is_artifact(Path::new("/project/tmp"), &patterns));
+        assert!(!is_artifact(Path::new("/project/tmp/file.txt"), &patterns));
+        assert!(is_artifact(Path::new("/project/module.pyc"), &patterns));
+        assert!(!is_artifact(
+            Path::new("/project/module.pyc/file.txt"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn multi_component_path_suffix_matches() {
+        let patterns = vec![
+            make_pattern("vendor/bundle"),
+            make_pattern("*.xcworkspace/xcuserdata"),
+        ];
+        assert!(is_artifact(Path::new("/project/vendor/bundle"), &patterns));
+        assert!(!is_artifact(
+            Path::new("/project/avendor/bundle"),
+            &patterns
+        ));
+        assert!(is_artifact(
+            Path::new("/project/MyApp.xcworkspace/xcuserdata"),
+            &patterns
+        ));
+        assert!(!is_artifact(
+            Path::new("/project/MyApp.xcworkspace"),
+            &patterns
+        ));
+    }
+
+    #[test]
+    fn root_scoped_pattern_requires_project_root() {
+        let patterns = vec![make_pattern("/build")];
+        assert!(!is_artifact(Path::new("/parent/build"), &patterns));
+    }
+
+    #[test]
+    fn is_recreatable_dir_matches_vendor_bundle() {
+        assert!(is_recreatable_dir(Path::new("/project/vendor/bundle")));
+        assert!(!is_recreatable_dir(Path::new("/project/avendor/bundle")));
+    }
 }

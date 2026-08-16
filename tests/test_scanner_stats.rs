@@ -13,6 +13,87 @@ fn older_than_five_days() -> TimeFilter {
 }
 
 #[test]
+fn file_artifacts_use_one_vcs_batch_call_per_project() {
+    use std::process::Command;
+
+    let dir = tempdir().unwrap();
+
+    // Initialize a real Git repository.
+    Command::new("git")
+        .arg("init")
+        .current_dir(dir.path())
+        .output()
+        .expect("git init failed");
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.email failed");
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git config user.name failed");
+
+    // Track one .aux file.
+    fs::write(dir.path().join("tracked.aux"), "tracked").unwrap();
+    Command::new("git")
+        .args(["add", "tracked.aux"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git add failed");
+    Command::new("git")
+        .args(["commit", "-m", "track"])
+        .current_dir(dir.path())
+        .output()
+        .expect("git commit failed");
+
+    // Create 50 untracked .aux files.
+    for i in 0..50 {
+        fs::write(dir.path().join(format!("untracked{}.aux", i)), "untracked").unwrap();
+    }
+
+    let patterns = get_artifact_patterns(false).unwrap();
+    let options = ScanOptions {
+        verbose: false,
+        calculate_sizes: false,
+    };
+    let result = scan_single_path(
+        dir.path().to_str().unwrap(),
+        &patterns,
+        &[],
+        options,
+        &TimeFilter::from_args(None, None).unwrap(),
+    )
+    .unwrap();
+
+    // The tracked file should be kept; only the 50 untracked files are reported.
+    let aux_artifacts: Vec<_> = result
+        .projects
+        .values()
+        .flat_map(|r| &r.artifacts)
+        .filter(|a| a.path.extension().is_some_and(|e| e == "aux"))
+        .collect();
+    assert_eq!(
+        aux_artifacts.len(),
+        50,
+        "all untracked .aux files should be reported"
+    );
+    assert!(
+        !aux_artifacts
+            .iter()
+            .any(|a| a.path.file_name().unwrap() == "tracked.aux"),
+        "tracked .aux file should not be reported for removal"
+    );
+
+    // Exactly one batch VCS call per project, regardless of how many file artifacts exist.
+    assert_eq!(
+        result.stats.vcs_batch_call_count, 1,
+        "should make exactly one batch VCS call per project"
+    );
+}
+
+#[test]
 fn file_artifact_time_filter_stats_count_file() {
     let dir = tempdir().unwrap();
     fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();

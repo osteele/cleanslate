@@ -207,6 +207,7 @@ dependencies = [
  "colored",
  "crossbeam-channel",
  "filetime",
+ "globset",
  "humansize",
  "ignore",
  "indicatif",
