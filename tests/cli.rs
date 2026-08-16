@@ -94,13 +94,14 @@ fn test_delete_flag() {
     assert!(dir.path().join("__pycache__").exists());
     assert!(dir.path().join("target").exists());
 
-    // Run the command with --delete
+    // Run the command with --delete --yes (non-interactive)
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd.arg(dir.path()).arg("--delete").assert();
+    let assert = cmd.arg(dir.path()).arg("--delete").arg("--yes").assert();
 
     assert
         .success()
-        .stdout(predicate::str::contains("Total Size Removed"));
+        .stdout(predicate::str::contains("Removed"))
+        .stdout(predicate::str::contains("artifact(s) across"));
 
     // Verify that our artifacts were deleted
     assert!(!dir.path().join("node_modules").exists());
@@ -124,7 +125,11 @@ fn test_delete_read_only_go_module_cache() {
     fs::set_permissions(&module_dir, fs::Permissions::from_mode(0o555)).unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    cmd.arg(dir.path()).arg("--delete").assert().success();
+    cmd.arg(dir.path())
+        .arg("--delete")
+        .arg("--yes")
+        .assert()
+        .success();
 
     assert!(!dir.path().join(".gomodcache").exists());
 }
@@ -137,7 +142,11 @@ fn test_delete_preserves_scan_root_and_empty_ancestors() {
     fs::write(scan_root.join("stale.log"), "log").unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    cmd.arg(&scan_root).arg("--delete").assert().success();
+    cmd.arg(&scan_root)
+        .arg("--delete")
+        .arg("--yes")
+        .assert()
+        .success();
 
     assert!(scan_root.exists());
     assert!(dir.path().join("outer").exists());
@@ -152,7 +161,11 @@ fn test_delete_preserves_non_aggressive_trivial_files() {
     fs::write(dir.path().join("output/.DS_Store"), "metadata").unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    cmd.arg(dir.path()).arg("--delete").assert().success();
+    cmd.arg(dir.path())
+        .arg("--delete")
+        .arg("--yes")
+        .assert()
+        .success();
 
     assert!(dir.path().join("output/.DS_Store").exists());
 }
@@ -165,7 +178,11 @@ fn test_delete_preserves_artifact_directory_with_nested_vcs() {
     fs::write(dir.path().join("node_modules/package/source.js"), "source").unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    cmd.arg(dir.path()).arg("--delete").assert().success();
+    cmd.arg(dir.path())
+        .arg("--delete")
+        .arg("--yes")
+        .assert()
+        .success();
 
     assert!(dir.path().join("node_modules/package/source.js").exists());
     assert!(dir.path().join("node_modules/package/.git").exists());
@@ -178,7 +195,11 @@ fn test_vcs_failure_fails_closed() {
     fs::write(dir.path().join("stale.log"), "log").unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    cmd.arg(dir.path()).arg("--delete").assert().success();
+    cmd.arg(dir.path())
+        .arg("--delete")
+        .arg("--yes")
+        .assert()
+        .success();
 
     assert!(dir.path().join("stale.log").exists());
 }
@@ -343,7 +364,8 @@ fn test_delete_yes_flag_deletes_without_prompt() {
 
     assert
         .success()
-        .stdout(predicate::str::contains("Total Size Removed"));
+        .stdout(predicate::str::contains("Removed"))
+        .stdout(predicate::str::contains("artifact(s) across"));
 
     assert!(!dir.path().join("node_modules").exists());
     assert!(!dir.path().join("__pycache__").exists());
@@ -351,7 +373,7 @@ fn test_delete_yes_flag_deletes_without_prompt() {
 }
 
 #[test]
-fn test_delete_with_non_tty_stdin_deletes_everything() {
+fn test_delete_non_tty_without_yes_refuses() {
     let dir = setup_test_directory();
 
     assert!(dir.path().join("node_modules").exists());
@@ -359,15 +381,16 @@ fn test_delete_with_non_tty_stdin_deletes_everything() {
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
     cmd.arg(dir.path()).arg("--delete");
-    // Pipe empty stdin so stdin is not a TTY; deletion should proceed without prompting.
+    // Pipe empty stdin so stdin is not a TTY; deletion without --yes must be refused.
     let assert = cmd.write_stdin("").assert();
 
-    assert
-        .success()
-        .stdout(predicate::str::contains("Total Size Removed"));
+    assert.failure().stderr(predicate::str::contains(
+        "refusing to delete without confirmation",
+    ));
 
-    assert!(!dir.path().join("node_modules").exists());
-    assert!(!dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
 }
 
 #[test]
@@ -382,7 +405,7 @@ fn test_yes_without_delete_errors() {
 
 #[test]
 fn test_selective_deletion_pass_only_removes_selected_projects() {
-    use cleanslate::{delete_selected_artifacts, ArtifactEntry, ProjectReport, ScanResult};
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport, ScanResult};
     use std::collections::{HashMap, HashSet};
 
     let dir = tempdir().unwrap();
@@ -406,6 +429,8 @@ fn test_selective_deletion_pass_only_removes_selected_projects() {
                 removed: false,
                 modified: None,
                 time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Logs,
                 files: Vec::new(),
             }],
         },
@@ -419,6 +444,8 @@ fn test_selective_deletion_pass_only_removes_selected_projects() {
                 removed: false,
                 modified: None,
                 time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Logs,
                 files: Vec::new(),
             }],
         },
@@ -431,13 +458,86 @@ fn test_selective_deletion_pass_only_removes_selected_projects() {
     };
 
     let selected: HashSet<std::path::PathBuf> = [project_a.clone()].into_iter().collect();
-    delete_selected_artifacts(&mut result.projects, &selected, false);
+    let summary = execute_plan(&mut result.projects, &selected, false);
 
     assert!(file_a.metadata().is_err());
     assert!(file_b.exists());
+
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.failures, 0);
 
     let a_removed = result.projects[&project_a].artifacts[0].removed;
     let b_removed = result.projects[&project_b].artifacts[0].removed;
     assert!(a_removed);
     assert!(!b_removed);
+}
+
+/// Regression test: --delete --yes must print a deletion summary, not redisplay
+/// the full scan table.
+#[test]
+fn test_delete_yes_prints_deletion_summary_not_table() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--delete").arg("--yes").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removed"))
+        .stdout(predicate::str::contains("artifact(s) across"))
+        .stdout(predicate::str::contains("skipped"))
+        // The full report table must NOT be redisplayed after deletion
+        .stdout(
+            predicate::str::contains("Path")
+                .and(predicate::str::contains("What"))
+                .not(),
+        )
+        .stdout(predicate::str::contains("Run with --list").not());
+
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(!dir.path().join("__pycache__").exists());
+    assert!(!dir.path().join("target").exists());
+}
+
+/// Regression test: --dry-run in default table mode (no --list) must list the
+/// artifacts in the report, delete nothing, and print the dry-run line.
+/// Previously the "Would remove" lines only appeared when combined with --list.
+#[test]
+fn test_dry_run_table_mode_lists_artifacts_and_deletes_nothing() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--dry-run").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("node_modules"))
+        .stdout(predicate::str::contains("__pycache__"))
+        .stdout(predicate::str::contains("target"))
+        .stdout(predicate::str::contains("Dry run: no files were deleted."))
+        // The dry run is a preview; it must not suggest a deletion command
+        .stdout(predicate::str::contains("To delete:").not());
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+}
+
+/// A plain scan (no --delete) is the preview: it shows the artifacts and the
+/// "To delete:" hint.
+#[test]
+fn test_plain_scan_shows_artifacts_and_delete_hint() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("node_modules"))
+        .stdout(predicate::str::contains("To delete: cleanslate --delete"));
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
 }

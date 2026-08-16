@@ -12,18 +12,21 @@
 //! - VCS tracking vs gitignore semantics (critical distinction!)
 //! - Empty directory cleanup strategy
 
+pub mod execute;
 pub mod patterns;
 pub mod scanner;
 pub mod time;
 pub mod vcs;
 
 // Re-export commonly used items
+pub use execute::{execute_plan, ExecutionSummary};
 pub use patterns::{
-    get_artifact_patterns, is_artifact, is_recreatable_dir, ArtifactPattern, ArtifactType,
+    get_artifact_patterns, is_artifact, is_recreatable_dir, matching_pattern, ArtifactPattern,
+    ArtifactType,
 };
 pub use scanner::{
-    delete_selected_artifacts, find_project_root, scan_single_path, truncate_name_with_suffix,
-    ArtifactEntry, ProjectReport, ScanOptions, ScanResult,
+    find_project_root, scan_single_path, truncate_name_with_suffix, ArtifactEntry, ProjectReport,
+    ScanOptions, ScanResult,
 };
 pub use time::{TimeFilter, TimeFilterContext, TimeFilterStats};
 pub use vcs::{detect_vcs, VcsCheckResult, VcsType};

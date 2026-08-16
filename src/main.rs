@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use cleanslate::{
-    delete_selected_artifacts, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
-    ArtifactPattern, ProjectReport, ScanOptions, ScanResult, TimeFilter, TimeFilterStats,
+    execute_plan, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
+    ExecutionSummary, ProjectReport, ScanOptions, ScanResult, TimeFilter, TimeFilterStats,
 };
 use colored::Colorize;
 use humansize::{format_size, BINARY};
@@ -10,7 +10,6 @@ use inquire::MultiSelect;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
     io::IsTerminal,
     path::PathBuf,
 };
@@ -39,8 +38,8 @@ struct Args {
     #[arg(long, short)]
     verbose: bool,
 
-    /// Show what would be deleted without actually deleting (implies --delete)
-    #[arg(long)]
+    /// Preview what would be deleted without deleting (cannot be combined with --delete)
+    #[arg(long, conflicts_with = "delete")]
     dry_run: bool,
 
     /// Show detailed list format instead of table (table is default)
@@ -91,7 +90,7 @@ fn scan_for_artifacts(
     exclude: Vec<String>,
     older_than: Option<String>,
     modified_before: Option<String>,
-) -> Result<(ScanResult, Vec<PathBuf>, Vec<ArtifactPattern>)> {
+) -> Result<(ScanResult, Vec<PathBuf>)> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
 
@@ -157,155 +156,59 @@ fn scan_for_artifacts(
             stats: combined_stats,
         },
         unique_paths,
-        patterns,
     ))
 }
 
-/// Remove empty directories after artifact deletion
-fn cleanup_empty_directories(projects: &HashMap<PathBuf, ProjectReport>, options: ScanOptions) {
-    // Collect all directories to check - both artifact dirs and parent dirs of removed files
-    let mut dirs_to_check: HashSet<PathBuf> = HashSet::new();
+/// Everything the report display needs, bundled to keep display signatures small
+struct Report<'a> {
+    projects: &'a HashMap<PathBuf, ProjectReport>,
+    unique_paths: &'a [PathBuf],
+    time_filter: &'a TimeFilter,
+    total_bytes: u64,
+    stats: &'a TimeFilterStats,
+    calculate_sizes: bool,
+}
 
-    for (project_root, project_report) in projects {
-        for entry in &project_report.artifacts {
-            if entry.removed {
-                let mut current = if entry.path.is_dir() {
-                    Some(entry.path.as_path())
-                } else {
-                    entry.path.parent()
-                };
-
-                while let Some(dir) = current {
-                    if dir == project_root || !dir.starts_with(project_root) {
-                        break;
-                    }
-                    dirs_to_check.insert(dir.to_path_buf());
-                    current = dir.parent();
-                }
-            }
-        }
-    }
-
-    // Sort directories by depth (deepest first) so we remove child dirs before parents
-    let mut dirs_vec: Vec<PathBuf> = dirs_to_check.into_iter().collect();
-    dirs_vec.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-
-    // Try to remove empty directories
-    // Only remove genuinely empty directories. Other files may be tracked or intentionally kept.
-    for dir in dirs_vec {
-        // Skip if doesn't exist
-        if !dir.exists() {
-            continue;
-        }
-
-        // Check whether the directory is empty
-        match fs::read_dir(&dir) {
-            Ok(entries) => {
-                // Collect all entries
-                let remaining: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-
-                if remaining.is_empty() {
-                    match fs::remove_dir(&dir) {
-                        Ok(_) => {
-                            if options.verbose {
-                                println!("Removed empty directory: {}", dir.display());
-                            }
-                        }
-                        Err(err) => {
-                            if options.verbose {
-                                eprintln!(
-                                    "Warning: Failed to remove directory {}: {}",
-                                    dir.display(),
-                                    err
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-            Err(_) => {
-                // Directory doesn't exist or can't be read, skip
-                continue;
-            }
-        }
-    }
+/// CLI arguments needed to reproduce this scan as a deletion command
+struct DeleteCommand<'a> {
+    paths: &'a [String],
+    older_than: &'a Option<String>,
+    modified_before: &'a Option<String>,
+    aggressive: bool,
+    exclude: &'a [String],
 }
 
 /// Display scan results in table or list format
-#[allow(clippy::too_many_arguments)]
-fn display_results(
-    projects: &HashMap<PathBuf, ProjectReport>,
-    unique_paths: &[PathBuf],
-    patterns: &[ArtifactPattern],
-    time_filter: &TimeFilter,
-    options: ScanOptions,
-    total_bytes: u64,
-    combined_stats: &TimeFilterStats,
-    paths: &[String],
-    older_than: &Option<String>,
-    modified_before: &Option<String>,
-    aggressive: bool,
-    exclude: &[String],
-) {
-    if projects.is_empty() {
+fn display_results(report: &Report, list: bool) {
+    if report.projects.is_empty() {
         println!("No artifacts found.");
-    } else if !options.list {
-        display_table_format(
-            projects,
-            unique_paths,
-            time_filter,
-            options,
-            paths,
-            older_than,
-            modified_before,
-            aggressive,
-            exclude,
-        );
+    } else if !list {
+        display_table_format(report);
     } else {
-        display_list_format(
-            projects,
-            unique_paths,
-            patterns,
-            time_filter,
-            options,
-            total_bytes,
-            paths,
-            older_than,
-            modified_before,
-            aggressive,
-            exclude,
-        );
+        display_list_format(report);
     }
 
     // Show time filter statistics if active (for all output formats)
-    if time_filter.is_active() && !projects.is_empty() {
+    if report.time_filter.is_active() && !report.projects.is_empty() {
         println!();
         println!(
             "Time Filter: {} of {} artifacts passed the filter ({} excluded)",
-            combined_stats.passed_time_filter,
-            combined_stats.total_found,
-            combined_stats.excluded_by_time
+            report.stats.passed_time_filter,
+            report.stats.total_found,
+            report.stats.excluded_by_time
         );
     }
 }
 
 /// Display results in table format (default)
-#[allow(clippy::too_many_arguments)]
-fn display_table_format(
-    projects: &HashMap<PathBuf, ProjectReport>,
-    unique_paths: &[PathBuf],
-    time_filter: &TimeFilter,
-    options: ScanOptions,
-    paths: &[String],
-    older_than: &Option<String>,
-    modified_before: &Option<String>,
-    aggressive: bool,
-    exclude: &[String],
-) {
+fn display_table_format(report: &Report) {
     use terminal_size::{terminal_size, Width};
 
-    let start_path = if unique_paths.len() == 1 {
-        &unique_paths[0]
+    let projects = report.projects;
+    let time_filter = report.time_filter;
+
+    let start_path = if report.unique_paths.len() == 1 {
+        &report.unique_paths[0]
     } else {
         // For multiple paths, use current directory as base
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -314,13 +217,13 @@ fn display_table_format(
     // Collect and sort projects by path, filtering out empty projects
     let mut sorted_projects: Vec<_> = projects
         .iter()
-        .filter(|(_, report)| {
+        .filter(|(_, project_report)| {
             // If calculating sizes, filter by size. Otherwise, just check if there are artifacts.
-            if options.calculate_sizes {
-                let total: u64 = report.artifacts.iter().map(|a| a.size).sum();
+            if report.calculate_sizes {
+                let total: u64 = project_report.artifacts.iter().map(|a| a.size).sum();
                 total > 0
             } else {
-                !report.artifacts.is_empty()
+                !project_report.artifacts.is_empty()
             }
         })
         .collect();
@@ -335,7 +238,7 @@ fn display_table_format(
     // Count total artifacts across all projects
     let total_artifact_count: usize = sorted_projects
         .iter()
-        .map(|(_, report)| report.artifacts.len())
+        .map(|(_, project_report)| project_report.artifacts.len())
         .sum();
 
     // Get terminal width (default to 120 if not available)
@@ -360,15 +263,15 @@ fn display_table_format(
         .min(40); // Cap path width at 40 chars
 
     // Fixed widths for size columns (only if calculate_sizes is enabled)
-    let removable_width = if options.calculate_sizes { 12 } else { 0 };
-    let too_recent_width = if options.calculate_sizes && time_filter.is_active() {
+    let removable_width = if report.calculate_sizes { 12 } else { 0 };
+    let too_recent_width = if report.calculate_sizes && time_filter.is_active() {
         12
     } else {
         0
     };
 
     // Calculate What column width
-    let separator_width = if options.calculate_sizes {
+    let separator_width = if report.calculate_sizes {
         if time_filter.is_active() {
             6
         } else {
@@ -385,7 +288,7 @@ fn display_table_format(
         .max(20);
 
     // Print header - hide size columns when not calculated
-    if !options.calculate_sizes {
+    if !report.calculate_sizes {
         // No size columns
         println!("{:<path_w$}  What", "Path", path_w = max_path_width);
     } else if time_filter.is_active() {
@@ -413,14 +316,14 @@ fn display_table_format(
     let mut total_too_recent: u64 = 0;
 
     // Print each project
-    for (project_dir, report) in &sorted_projects {
-        let removable_size: u64 = report
+    for (project_dir, project_report) in &sorted_projects {
+        let removable_size: u64 = project_report
             .artifacts
             .iter()
             .filter(|a| !a.time_filtered)
             .map(|a| a.size)
             .sum();
-        let too_recent_size: u64 = report
+        let too_recent_size: u64 = project_report
             .artifacts
             .iter()
             .filter(|a| a.time_filtered)
@@ -442,7 +345,7 @@ fn display_table_format(
         };
 
         // Collect artifact names sorted by size (largest first)
-        let mut artifacts_with_size: Vec<(String, u64)> = report
+        let mut artifacts_with_size: Vec<(String, u64)> = project_report
             .artifacts
             .iter()
             .map(|a| {
@@ -503,7 +406,7 @@ fn display_table_format(
         let what_display = what_parts.join(", ");
 
         // Print row based on whether sizes are calculated
-        if !options.calculate_sizes {
+        if !report.calculate_sizes {
             // No size columns - just path and what
             println!(
                 "{:<path_w$}  {}",
@@ -553,7 +456,7 @@ fn display_table_format(
     println!("{}", "─".repeat(terminal_width.min(120)));
 
     // Print total row
-    if !options.calculate_sizes {
+    if !report.calculate_sizes {
         // Show count of projects and artifacts instead of sizes
         println!(
             "\nFound {} artifact(s) across {} project(s). Use --calculate-sizes to see sizes.",
@@ -580,61 +483,30 @@ fn display_table_format(
         );
     }
 
-    // Show deletion summary for table format
-    if options.delete && !options.dry_run {
-        let removed_bytes: u64 = projects
-            .values()
-            .flat_map(|r| &r.artifacts)
-            .filter(|a| a.removed)
-            .map(|a| a.size)
-            .sum();
-        println!(
-            "\nTotal Size Removed: {}",
-            format_size(removed_bytes, BINARY).bold().red()
-        );
-    } else if options.dry_run {
-        println!("\nDry run mode: No files were deleted.");
-    } else if !options.delete && total_removable > 0 {
-        print_delete_command(paths, older_than, modified_before, aggressive, exclude);
-    }
-
     println!("\nRun with --list to see detailed breakdown by project");
 }
 
 /// Display results in list format
-#[allow(clippy::too_many_arguments)]
-fn display_list_format(
-    projects: &HashMap<PathBuf, ProjectReport>,
-    unique_paths: &[PathBuf],
-    patterns: &[ArtifactPattern],
-    time_filter: &TimeFilter,
-    options: ScanOptions,
-    total_bytes: u64,
-    paths: &[String],
-    older_than: &Option<String>,
-    modified_before: &Option<String>,
-    aggressive: bool,
-    exclude: &[String],
-) {
-    let start_path = if unique_paths.len() == 1 {
-        &unique_paths[0]
+fn display_list_format(report: &Report) {
+    let start_path = if report.unique_paths.len() == 1 {
+        &report.unique_paths[0]
     } else {
         // For multiple paths, use current directory as base
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
 
     // Sort projects alphabetically by path
-    let mut sorted_projects: Vec<_> = projects.iter().collect();
+    let mut sorted_projects: Vec<_> = report.projects.iter().collect();
     sorted_projects.sort_by_key(|(path, _)| path.to_string_lossy().to_string());
 
-    for (project_dir, report) in sorted_projects {
-        let removable_size: u64 = report
+    for (project_dir, project_report) in sorted_projects {
+        let removable_size: u64 = project_report
             .artifacts
             .iter()
             .filter(|a| !a.time_filtered)
             .map(|a| a.size)
             .sum();
-        let too_recent_size: u64 = report
+        let too_recent_size: u64 = project_report
             .artifacts
             .iter()
             .filter(|a| a.time_filtered)
@@ -643,10 +515,10 @@ fn display_list_format(
         let total_project_size = removable_size + too_recent_size;
 
         // Skip empty projects - check artifact count when sizes not calculated
-        let has_artifacts = if options.calculate_sizes {
+        let has_artifacts = if report.calculate_sizes {
             total_project_size > 0
         } else {
-            !report.artifacts.is_empty()
+            !project_report.artifacts.is_empty()
         };
         if !has_artifacts {
             continue;
@@ -666,30 +538,23 @@ fn display_list_format(
 
         println!("{}", path_display.bold());
 
-        // Aggregate by language and collect artifact names
+        // Aggregate by the language recorded at match time and collect artifact names
         let mut language_summary: HashMap<String, (u64, Vec<String>)> = HashMap::new();
 
-        for artifact in &report.artifacts {
-            let path = &artifact.path;
-            let path_str = path.to_string_lossy();
-            let filename = path
+        for artifact in &project_report.artifacts {
+            let filename = artifact
+                .path
                 .file_name()
                 .map(|f| f.to_string_lossy())
                 .unwrap_or_default()
                 .to_string();
 
-            // Find the matching pattern to get the language
-            if let Some(matching_pattern) = patterns
-                .iter()
-                .find(|p| p.pattern == filename || path_str.contains(&p.pattern))
-            {
-                let entry = language_summary
-                    .entry(matching_pattern.language_name.clone())
-                    .or_insert((0, Vec::new()));
-                entry.0 += artifact.size;
-                if !entry.1.contains(&filename) {
-                    entry.1.push(filename);
-                }
+            let entry = language_summary
+                .entry(artifact.language_name.clone())
+                .or_insert((0, Vec::new()));
+            entry.0 += artifact.size;
+            if !entry.1.contains(&filename) {
+                entry.1.push(filename);
             }
         }
 
@@ -707,7 +572,7 @@ fn display_list_format(
             );
         }
 
-        if time_filter.is_active() && too_recent_size > 0 {
+        if report.time_filter.is_active() && too_recent_size > 0 {
             println!(
                 "  {} (Removable: {}, Too Recent: {})",
                 format!("Total: {}", format_size(total_project_size, BINARY)).green(),
@@ -726,152 +591,46 @@ fn display_list_format(
     println!("========================================");
     println!(
         "Total Size Found: {}",
-        format_size(total_bytes, BINARY).bold()
+        format_size(report.total_bytes, BINARY).bold()
     );
-    if options.delete && !options.dry_run {
-        let removed_bytes: u64 = projects
-            .values()
-            .flat_map(|r| &r.artifacts)
-            .filter(|a| a.removed)
-            .map(|a| a.size)
-            .sum();
-        println!(
-            "Total Size Removed: {}",
-            format_size(removed_bytes, BINARY).bold().red()
-        );
-    } else if options.dry_run {
-        println!("Dry run mode: No files were deleted.");
-    } else if !options.delete && total_bytes > 0 {
-        print_delete_command(paths, older_than, modified_before, aggressive, exclude);
-    }
 }
 
 /// Print the command to delete artifacts
-fn print_delete_command(
-    paths: &[String],
-    older_than: &Option<String>,
-    modified_before: &Option<String>,
-    aggressive: bool,
-    exclude: &[String],
-) {
-    let mut cmd = String::from("cleanslate --delete");
-    if let Some(days) = older_than {
-        cmd.push_str(&format!(" --older-than {}", days));
+fn print_delete_command(cmd: &DeleteCommand) {
+    let mut command = String::from("cleanslate --delete");
+    if let Some(days) = cmd.older_than {
+        command.push_str(&format!(" --older-than {}", days));
     }
-    if let Some(ref date) = modified_before {
-        cmd.push_str(&format!(" --modified-before {}", date));
+    if let Some(ref date) = cmd.modified_before {
+        command.push_str(&format!(" --modified-before {}", date));
     }
-    if aggressive {
-        cmd.push_str(" --aggressive");
+    if cmd.aggressive {
+        command.push_str(" --aggressive");
     }
-    for ex in exclude {
-        cmd.push_str(&format!(" --exclude {}", ex));
+    for ex in cmd.exclude {
+        command.push_str(&format!(" --exclude {}", ex));
     }
-    if !paths.is_empty() && paths[0] != "." {
-        for path in paths {
-            cmd.push_str(&format!(" {}", path));
+    if !cmd.paths.is_empty() && cmd.paths[0] != "." {
+        for path in cmd.paths {
+            command.push_str(&format!(" {}", path));
         }
     }
-    println!("\nTo delete: {}", cmd);
+    println!("\nTo delete: {}", command);
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
-
-    let options = ScanOptions {
-        delete: args.delete,
-        verbose: args.verbose,
-        dry_run: args.dry_run,
-        list: args.list,
-        calculate_sizes: args.calculate_sizes,
-    };
-
-    let is_interactive = args.delete
-        && !args.dry_run
-        && !args.yes
-        && std::io::stdin().is_terminal()
-        && std::io::stderr().is_terminal();
-
-    if is_interactive {
-        run_interactive_deletion(&args, options)?;
-    } else {
-        run_direct_deletion(&args, options)?;
-    }
-
-    Ok(())
+/// Whether the scan found any artifact that a deletion run would act on
+fn has_removable_artifacts(projects: &HashMap<PathBuf, ProjectReport>) -> bool {
+    projects
+        .values()
+        .any(|report| report.artifacts.iter().any(|a| !a.time_filtered))
 }
 
-fn run_direct_deletion(args: &Args, options: ScanOptions) -> Result<()> {
-    let (result, unique_paths, patterns) = scan_for_artifacts(
-        &args.paths,
-        options,
-        args.aggressive,
-        args.exclude.clone(),
-        args.older_than.clone(),
-        args.modified_before.clone(),
-    )?;
-
-    if options.delete && !options.dry_run {
-        cleanup_empty_directories(&result.projects, options);
-    }
-
-    let time_filter =
-        TimeFilter::from_args(args.older_than.as_deref(), args.modified_before.as_deref())?;
-    display_results(
-        &result.projects,
-        &unique_paths,
-        &patterns,
-        &time_filter,
-        options,
-        result.total_bytes,
-        &result.stats,
-        &args.paths,
-        &args.older_than,
-        &args.modified_before,
-        args.aggressive,
-        &args.exclude,
-    );
-
-    Ok(())
-}
-
-fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
-    // Scan first without deleting to collect the artifact report.
-    let scan_options = ScanOptions {
-        delete: false,
-        dry_run: false,
-        ..options
-    };
-    let (mut result, unique_paths, patterns) = scan_for_artifacts(
-        &args.paths,
-        scan_options,
-        args.aggressive,
-        args.exclude.clone(),
-        args.older_than.clone(),
-        args.modified_before.clone(),
-    )?;
-
-    let time_filter =
-        TimeFilter::from_args(args.older_than.as_deref(), args.modified_before.as_deref())?;
-
-    if result.projects.is_empty() {
-        display_results(
-            &result.projects,
-            &unique_paths,
-            &patterns,
-            &time_filter,
-            scan_options,
-            result.total_bytes,
-            &result.stats,
-            &args.paths,
-            &args.older_than,
-            &args.modified_before,
-            args.aggressive,
-            &args.exclude,
-        );
-        return Ok(());
-    }
-
+/// Prompt the user to select which projects to clean. Returns None if the prompt is canceled.
+fn select_projects_interactively(
+    projects: &HashMap<PathBuf, ProjectReport>,
+    unique_paths: &[PathBuf],
+    calculate_sizes: bool,
+) -> Result<Option<HashSet<PathBuf>>> {
     // Build the list of projects shown in the multi-select prompt.
     let start_path = if unique_paths.len() == 1 {
         unique_paths[0].clone()
@@ -879,8 +638,7 @@ fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     };
 
-    let mut project_items: Vec<(PathBuf, String)> = result
-        .projects
+    let mut project_items: Vec<(PathBuf, String)> = projects
         .iter()
         .filter(|(_, report)| !report.artifacts.is_empty())
         .map(|(path, report)| {
@@ -900,7 +658,7 @@ fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
             } else {
                 relative
             };
-            let label = if options.calculate_sizes {
+            let label = if calculate_sizes {
                 format!("{} ({})", display, format_size(removable_size, BINARY))
             } else {
                 display
@@ -923,8 +681,7 @@ fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
         Ok(selection) => selection,
         Err(inquire::InquireError::OperationCanceled)
         | Err(inquire::InquireError::OperationInterrupted) => {
-            println!("No artifacts deleted.");
-            return Ok(());
+            return Ok(None);
         }
         Err(err) => return Err(err.into()),
     };
@@ -939,28 +696,130 @@ fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
         })
         .collect();
 
-    delete_selected_artifacts(&mut result.projects, &selected_paths, options.verbose);
-    cleanup_empty_directories(&result.projects, options);
+    Ok(Some(selected_paths))
+}
 
-    let display_options = ScanOptions {
-        delete: true,
-        dry_run: false,
-        ..options
-    };
-    display_results(
-        &result.projects,
-        &unique_paths,
-        &patterns,
-        &time_filter,
-        display_options,
-        result.total_bytes,
-        &result.stats,
-        &args.paths,
-        &args.older_than,
-        &args.modified_before,
-        args.aggressive,
-        &args.exclude,
+/// Print the outcome of a deletion run (instead of redisplaying the scan table)
+fn print_execution_summary(
+    projects: &HashMap<PathBuf, ProjectReport>,
+    selected: &HashSet<PathBuf>,
+    summary: &ExecutionSummary,
+    calculate_sizes: bool,
+) {
+    let projects_cleaned = projects
+        .iter()
+        .filter(|(path, report)| {
+            selected.contains(*path) && report.artifacts.iter().any(|a| a.removed)
+        })
+        .count();
+    let projects_skipped = projects
+        .iter()
+        .filter(|(path, report)| !selected.contains(*path) && !report.artifacts.is_empty())
+        .count();
+
+    println!(
+        "Removed {} artifact(s) across {} project(s); skipped {} project(s).",
+        summary.artifacts_removed, projects_cleaned, projects_skipped
     );
+    if calculate_sizes {
+        println!(
+            "Total Size Removed: {}",
+            format_size(summary.bytes_removed, BINARY).bold().red()
+        );
+    }
+    if summary.failures > 0 {
+        println!("{} removal(s) failed.", summary.failures);
+    }
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    // Deletion without --yes requires an interactive confirmation prompt; refuse when
+    // there is no terminal to prompt on rather than deleting silently.
+    if args.delete
+        && !args.yes
+        && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal())
+    {
+        eprintln!(
+            "cleanslate: refusing to delete without confirmation in a non-interactive session; pass --yes to confirm"
+        );
+        std::process::exit(1);
+    }
+
+    // Stage 1: scan (pure - never deletes)
+    let options = ScanOptions {
+        verbose: args.verbose,
+        calculate_sizes: args.calculate_sizes,
+    };
+    let (mut result, unique_paths) = scan_for_artifacts(
+        &args.paths,
+        options,
+        args.aggressive,
+        args.exclude.clone(),
+        args.older_than.clone(),
+        args.modified_before.clone(),
+    )?;
+
+    let time_filter =
+        TimeFilter::from_args(args.older_than.as_deref(), args.modified_before.as_deref())?;
+    let report = Report {
+        projects: &result.projects,
+        unique_paths: &unique_paths,
+        time_filter: &time_filter,
+        total_bytes: result.total_bytes,
+        stats: &result.stats,
+        calculate_sizes: args.calculate_sizes,
+    };
+
+    // Preview modes: a plain scan IS the preview; --dry-run is the same preview
+    // without the deletion hint.
+    if !args.delete {
+        display_results(&report, args.list);
+        if args.dry_run {
+            println!("Dry run: no files were deleted.");
+        } else if has_removable_artifacts(&result.projects) {
+            print_delete_command(&DeleteCommand {
+                paths: &args.paths,
+                older_than: &args.older_than,
+                modified_before: &args.modified_before,
+                aggressive: args.aggressive,
+                exclude: &args.exclude,
+            });
+        }
+        return Ok(());
+    }
+
+    if result
+        .projects
+        .values()
+        .all(|report| report.artifacts.is_empty())
+    {
+        display_results(&report, args.list);
+        return Ok(());
+    }
+
+    // Stage 2: select which projects to clean
+    let selected = if args.yes {
+        result.projects.keys().cloned().collect()
+    } else {
+        match select_projects_interactively(&result.projects, &unique_paths, args.calculate_sizes)?
+        {
+            Some(selected) => selected,
+            None => {
+                println!("No artifacts deleted.");
+                return Ok(());
+            }
+        }
+    };
+
+    // Stage 3: execute (the only stage that deletes)
+    let summary = execute_plan(&mut result.projects, &selected, args.verbose);
+    print_execution_summary(&result.projects, &selected, &summary, args.calculate_sizes);
+
+    if summary.failures > 0 {
+        std::process::exit(1);
+    }
 
     Ok(())
 }

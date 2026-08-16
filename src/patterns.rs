@@ -22,7 +22,6 @@ pub enum ArtifactType {
 #[derive(Debug, Clone)]
 pub struct ArtifactPattern {
     pub pattern: String,
-    #[allow(dead_code)]
     pub artifact_type: ArtifactType,
     /// Is this a standalone pattern or should it be properly contextualized?
     /// For example, "dist" should only match at the project root level, not any directory named "dist"
@@ -210,15 +209,18 @@ pub fn get_artifact_patterns(aggressive: bool) -> Result<Vec<ArtifactPattern>> {
     Ok(patterns)
 }
 
-/// Check if a path is an artifact based on the patterns
-/// Uses a whitelist approach - only returns true for paths that explicitly match known artifact patterns
-pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
+/// Return the pattern that classifies `path` as an artifact, if any.
+/// Uses a whitelist approach - only paths that explicitly match known artifact patterns match.
+pub fn matching_pattern<'a>(
+    path: &Path,
+    patterns: &'a [ArtifactPattern],
+) -> Option<&'a ArtifactPattern> {
     let filename = path
         .file_name()
         .map(|f| f.to_string_lossy())
         .unwrap_or_default();
 
-    // Now apply whitelist pattern matching - ONLY return true if we match a known artifact pattern
+    // Now apply whitelist pattern matching - ONLY match known artifact patterns
     for pattern in patterns {
         // Handle patterns that need context (starting with /)
         if pattern.needs_context {
@@ -228,7 +230,7 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
                 // Check if parent is a project root
                 if let Some(parent) = path.parent() {
                     if is_project_root(parent) {
-                        return true;
+                        return Some(pattern);
                     }
                 }
             }
@@ -239,7 +241,7 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
         if pattern.pattern.contains('/') {
             // Multi-component pattern like "vendor/bundle" or "*.xcworkspace/xcuserdata"
             if matches_path_suffix(path, &pattern.pattern) {
-                return true;
+                return Some(pattern);
             }
             continue;
         }
@@ -248,7 +250,7 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
         if let Some(suffix) = pattern.pattern.strip_prefix('*') {
             // Match against filename for suffix patterns (e.g., *.pyc)
             if filename.ends_with(suffix) {
-                return true;
+                return Some(pattern);
             }
         } else if pattern.pattern.contains('*') {
             // Handle glob patterns - match against filename only
@@ -256,18 +258,24 @@ pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
             if parts.len() == 2 {
                 let filename_str = filename.to_string();
                 if filename_str.starts_with(parts[0]) && filename_str.ends_with(parts[1]) {
-                    return true;
+                    return Some(pattern);
                 }
             }
         } else if filename == pattern.pattern {
             // Exact names match at any traversal depth. Only inspect the candidate's
             // filename: absolute ancestors may coincidentally be named "tmp", "env", etc.
-            return true;
+            return Some(pattern);
         }
     }
 
-    // Default to false - only explicit matches are considered artifacts
-    false
+    // Default to no match - only explicit matches are considered artifacts
+    None
+}
+
+/// Check if a path is an artifact based on the patterns
+/// Uses a whitelist approach - only returns true for paths that explicitly match known artifact patterns
+pub fn is_artifact(path: &Path, patterns: &[ArtifactPattern]) -> bool {
+    matching_pattern(path, patterns).is_some()
 }
 
 /// Helper function to match multi-component patterns against path suffixes

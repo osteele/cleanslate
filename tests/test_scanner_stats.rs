@@ -25,10 +25,7 @@ fn file_artifact_time_filter_stats_count_file() {
 
     let patterns = get_artifact_patterns(false).unwrap();
     let options = ScanOptions {
-        delete: false,
         verbose: false,
-        dry_run: false,
-        list: false,
         calculate_sizes: false,
     };
     let result = scan_single_path(
@@ -59,10 +56,7 @@ fn category2_directory_time_filter_stats_count_directory() {
 
     let patterns = get_artifact_patterns(false).unwrap();
     let options = ScanOptions {
-        delete: false,
         verbose: false,
-        dry_run: false,
-        list: false,
         calculate_sizes: false,
     };
     let result = scan_single_path(
@@ -95,10 +89,7 @@ fn category3_directory_time_filter_stats_count_files() {
 
     let patterns = get_artifact_patterns(false).unwrap();
     let options = ScanOptions {
-        delete: false,
         verbose: false,
-        dry_run: false,
-        list: false,
         calculate_sizes: false,
     };
     let result = scan_single_path(

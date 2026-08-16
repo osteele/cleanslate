@@ -1,6 +1,8 @@
-//! Project discovery and artifact scanning.
+//! Project discovery and artifact scanning. Scanning is pure: it never deletes.
 
-use crate::patterns::{is_artifact, is_project_root, is_recreatable_dir, ArtifactPattern};
+use crate::patterns::{
+    is_project_root, is_recreatable_dir, matching_pattern, ArtifactPattern, ArtifactType,
+};
 use crate::time::{TimeFilter, TimeFilterContext, TimeFilterStats};
 use crate::vcs::{
     detect_vcs, get_tracked_files_batch, has_tracked_files, is_tracked_in_vcs, VcsCheckResult,
@@ -14,7 +16,6 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,10 +24,7 @@ use std::time::SystemTime;
 /// Options controlling scan behavior (runtime flags)
 #[derive(Clone, Copy)]
 pub struct ScanOptions {
-    pub delete: bool,
     pub verbose: bool,
-    pub dry_run: bool,
-    pub list: bool,
     pub calculate_sizes: bool,
 }
 
@@ -38,6 +36,10 @@ pub struct ArtifactEntry {
     #[allow(dead_code)]
     pub modified: Option<SystemTime>,
     pub time_filtered: bool,
+    /// Language name from the pattern that matched this artifact (e.g., "Python")
+    pub language_name: String,
+    /// Artifact type from the pattern that matched this artifact
+    pub artifact_type: ArtifactType,
     /// Files to remove for Category 3 (mixed) directories; empty for Category 2 dirs and files.
     pub files: Vec<PathBuf>,
 }
@@ -100,141 +102,6 @@ fn contains_vcs_checkout(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Make a vetted recreatable directory removable by its owner without following symlinks.
-/// Go module caches make downloaded directories read-only, which prevents remove_dir_all
-/// even though every file in the cache is disposable.
-fn make_tree_removable(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.is_symlink() {
-        return Ok(());
-    }
-
-    if metadata.is_dir() {
-        make_directory_removable(path, &metadata)?;
-        for entry in fs::read_dir(path)? {
-            make_tree_removable(&entry?.path())?;
-        }
-    } else {
-        make_file_removable(path, &metadata)?;
-    }
-
-    Ok(())
-}
-
-#[cfg(unix)]
-fn make_directory_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mut permissions = metadata.permissions();
-    let mode = permissions.mode();
-    if mode & 0o700 != 0o700 {
-        permissions.set_mode(mode | 0o700);
-        fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_directory_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    make_file_removable(path, metadata)
-}
-
-#[cfg(unix)]
-fn make_file_removable(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn make_file_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
-    let mut permissions = metadata.permissions();
-    if permissions.readonly() {
-        permissions.set_readonly(false);
-        fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
-}
-
-fn remove_recreatable_dir(path: &Path) -> io::Result<()> {
-    match fs::remove_dir_all(path) {
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            make_tree_removable(path)?;
-            fs::remove_dir_all(path)
-        }
-        result => result,
-    }
-}
-
-/// Remove a single file artifact, logging per-file errors.
-pub fn remove_file_artifact(path: &Path, verbose: bool) -> bool {
-    match fs::remove_file(path) {
-        Ok(_) => {
-            if verbose {
-                println!("Removed: {}", path.display());
-            }
-            true
-        }
-        Err(err) => {
-            eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
-            false
-        }
-    }
-}
-
-/// Remove a recreatable (Category 2) directory artifact.
-pub fn remove_recreatable_artifact(path: &Path, verbose: bool) -> bool {
-    match remove_recreatable_dir(path) {
-        Ok(_) => {
-            if verbose {
-                println!("Removed directory: {}", path.display());
-            }
-            true
-        }
-        Err(err) => {
-            eprintln!("Error removing {}: {}", path.display(), err);
-            false
-        }
-    }
-}
-
-/// Remove a Category 3 (mixed) directory artifact by removing its untracked files.
-pub fn remove_category3_artifact(files: &[PathBuf], verbose: bool) -> bool {
-    let mut removed = false;
-    for file_path in files {
-        if remove_file_artifact(file_path, verbose) {
-            removed = true;
-        }
-    }
-    removed
-}
-
-/// Delete artifacts belonging to the selected projects.
-/// Updates `entry.removed` for each artifact actually removed.
-pub fn delete_selected_artifacts(
-    projects: &mut HashMap<PathBuf, ProjectReport>,
-    selected_projects: &HashSet<PathBuf>,
-    verbose: bool,
-) {
-    for (project_path, project_report) in projects.iter_mut() {
-        if !selected_projects.contains(project_path) {
-            continue;
-        }
-        for entry in &mut project_report.artifacts {
-            if entry.time_filtered {
-                continue;
-            }
-            entry.removed = if entry.path.is_dir() {
-                if entry.files.is_empty() {
-                    remove_recreatable_artifact(&entry.path, verbose)
-                } else {
-                    remove_category3_artifact(&entry.files, verbose)
-                }
-            } else {
-                remove_file_artifact(&entry.path, verbose)
-            };
-        }
-    }
-}
-
 /// Check if a path should be excluded based on directory name matching
 pub fn should_exclude_path(path: &Path, excludes: &[String]) -> bool {
     if excludes.is_empty() {
@@ -294,8 +161,8 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
 /// Handle a directory artifact (Category 2 or Category 3)
 fn handle_directory_artifact(
     path: &Path,
-    start_path: &Path,
     project_root: &Path,
+    pattern: &ArtifactPattern,
     projects: &mut HashMap<PathBuf, ProjectReport>,
     skip_paths: &Arc<Mutex<HashSet<PathBuf>>>,
     options: ScanOptions,
@@ -305,7 +172,7 @@ fn handle_directory_artifact(
 
     // Detect VCS type once for this directory
     let (vcs_type, vcs_root) = detect_vcs(path);
-    let vcs_root = vcs_root.unwrap_or_else(|| start_path.to_path_buf());
+    let vcs_root = vcs_root.unwrap_or_else(|| project_root.to_path_buf());
 
     match contains_vcs_checkout(path) {
         Ok(true) => {
@@ -411,17 +278,6 @@ fn handle_directory_artifact(
                 artifacts: Vec::new(),
             });
 
-        // Remove entire directory if in delete mode AND passes time filter
-        let should_remove = passes_time_filter && (options.delete || options.dry_run);
-        let removed = if should_remove && options.delete && !options.dry_run {
-            remove_recreatable_artifact(path, options.verbose)
-        } else if should_remove && options.dry_run && options.list {
-            println!("Would remove directory: {}", path.display());
-            false
-        } else {
-            false
-        };
-
         let dir_modified = fs::symlink_metadata(path)
             .ok()
             .and_then(|m| m.modified().ok());
@@ -429,9 +285,11 @@ fn handle_directory_artifact(
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_size,
-            removed,
+            removed: false,
             modified: dir_modified,
             time_filtered: !passes_time_filter,
+            language_name: pattern.language_name.clone(),
+            artifact_type: pattern.artifact_type,
             files: Vec::new(),
         });
 
@@ -526,7 +384,7 @@ fn handle_directory_artifact(
         }
     }
 
-    // Only report and remove if there are untracked files that pass the time filter
+    // Only report if there are untracked files that pass the time filter
     if !files_to_remove.is_empty() {
         // For Category 3: files are already filtered by mtime, so add size unconditionally
         total_bytes += dir_total_size;
@@ -537,21 +395,7 @@ fn handle_directory_artifact(
                 artifacts: Vec::new(),
             });
 
-        // Remove files if in delete mode (files already passed time filter check)
-        let should_remove = options.delete || options.dry_run;
         let file_paths: Vec<PathBuf> = files_to_remove.iter().map(|(p, _)| p.clone()).collect();
-        let removed = if should_remove && options.delete && !options.dry_run {
-            remove_category3_artifact(&file_paths, options.verbose)
-        } else if should_remove && options.dry_run && options.list {
-            println!(
-                "Would remove: {} ({} untracked files)",
-                path.display(),
-                files_to_remove.len()
-            );
-            false
-        } else {
-            false
-        };
 
         let dir_modified = fs::symlink_metadata(path)
             .ok()
@@ -561,9 +405,11 @@ fn handle_directory_artifact(
         project_report.artifacts.push(ArtifactEntry {
             path: path.to_path_buf(),
             size: dir_total_size,
-            removed,
+            removed: false,
             modified: dir_modified,
             time_filtered: false, // Files already passed time filter check
+            language_name: pattern.language_name.clone(),
+            artifact_type: pattern.artifact_type,
             files: file_paths,
         });
     }
@@ -577,6 +423,7 @@ fn handle_file_artifact(
     path: &Path,
     metadata: &fs::Metadata,
     project_root: &Path,
+    pattern: &ArtifactPattern,
     projects: &mut HashMap<PathBuf, ProjectReport>,
     options: ScanOptions,
     time_ctx: &mut TimeFilterContext,
@@ -645,23 +492,14 @@ fn handle_file_artifact(
             artifacts: Vec::new(),
         });
 
-    // Only remove if passes time filter
-    let should_remove = passes_time_filter && (options.delete || options.dry_run);
-    let removed = if should_remove && !options.dry_run {
-        remove_file_artifact(path, options.verbose)
-    } else if should_remove && options.dry_run && options.list {
-        println!("Would remove: {}", path.display());
-        false
-    } else {
-        false // Not removed if doesn't pass time filter or neither delete nor dry_run
-    };
-
     project_report.artifacts.push(ArtifactEntry {
         path: path.to_path_buf(),
         size,
-        removed,
+        removed: false,
         modified: modified_time,
         time_filtered: !passes_time_filter,
+        language_name: pattern.language_name.clone(),
+        artifact_type: pattern.artifact_type,
         files: Vec::new(),
     });
 
@@ -868,8 +706,8 @@ fn scan_project_for_artifacts(
             }
         }
 
-        // Check if the path is an artifact
-        if is_artifact(path, patterns) {
+        // Check if the path is an artifact, and which pattern matched it
+        if let Some(pattern) = matching_pattern(path, patterns) {
             let metadata = match fs::symlink_metadata(path) {
                 Ok(meta) => meta,
                 Err(err) => {
@@ -899,7 +737,7 @@ fn scan_project_for_artifacts(
                 let bytes = handle_directory_artifact(
                     path,
                     &project_root,
-                    &project_root,
+                    pattern,
                     &mut projects,
                     &skip_paths,
                     options,
@@ -911,6 +749,7 @@ fn scan_project_for_artifacts(
                     path,
                     &metadata,
                     &project_root,
+                    pattern,
                     &mut projects,
                     options,
                     &mut time_ctx,
