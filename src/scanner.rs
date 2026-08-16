@@ -262,6 +262,7 @@ pub fn find_project_root(path: &Path) -> Option<PathBuf> {
         "package.json",   // JavaScript/Node
         "go.mod",         // Go
         ".git",           // Generic project indicator
+        ".jj",            // Jujutsu VCS
     ];
 
     // Start from the parent if path is a file
@@ -302,35 +303,9 @@ fn handle_directory_artifact(
 ) -> Result<u64> {
     let mut total_bytes = 0u64;
 
-    time_ctx.stats.total_found += 1;
-
     // Detect VCS type once for this directory
     let (vcs_type, vcs_root) = detect_vcs(path);
     let vcs_root = vcs_root.unwrap_or_else(|| start_path.to_path_buf());
-
-    // Check time filter for directories (using directory's own modification time)
-    let passes_time_filter = if time_ctx.filter.is_active() {
-        if let Ok(metadata) = fs::symlink_metadata(path) {
-            if let Ok(mtime) = metadata.modified() {
-                time_ctx.filter.passes(mtime)
-            } else {
-                true // If we can't get mtime, assume it passes
-            }
-        } else {
-            true // If we can't get metadata, assume it passes
-        }
-    } else {
-        true // No time filter active
-    };
-
-    if passes_time_filter {
-        time_ctx.stats.passed_time_filter += 1;
-    } else {
-        time_ctx.stats.excluded_by_time += 1;
-        if options.verbose {
-            println!("Directory filtered by time: {}", path.display());
-        }
-    }
 
     match contains_vcs_checkout(path) {
         Ok(true) => {
@@ -388,6 +363,32 @@ fn handle_directory_artifact(
             }
             Some(false) => {
                 // No tracked files, continue with removal
+            }
+        }
+
+        // Check time filter for directories (using directory's own modification time)
+        let passes_time_filter = if time_ctx.filter.is_active() {
+            if let Ok(metadata) = fs::symlink_metadata(path) {
+                if let Ok(mtime) = metadata.modified() {
+                    time_ctx.filter.passes(mtime)
+                } else {
+                    true // If we can't get mtime, assume it passes
+                }
+            } else {
+                true // If we can't get metadata, assume it passes
+            }
+        } else {
+            true // No time filter active
+        };
+
+        // This directory is a candidate for removal.
+        time_ctx.stats.total_found += 1;
+        if passes_time_filter {
+            time_ctx.stats.passed_time_filter += 1;
+        } else {
+            time_ctx.stats.excluded_by_time += 1;
+            if options.verbose {
+                println!("Directory filtered by time: {}", path.display());
             }
         }
 
@@ -495,6 +496,17 @@ fn handle_directory_artifact(
                 true // No time filter active
             };
 
+            // Each untracked file is a candidate for removal.
+            time_ctx.stats.total_found += 1;
+            if file_passes_time_filter {
+                time_ctx.stats.passed_time_filter += 1;
+            } else {
+                time_ctx.stats.excluded_by_time += 1;
+                if options.verbose {
+                    println!("File filtered by time: {}", file_path.display());
+                }
+            }
+
             // Only add to removal list if it passes time filter
             if file_passes_time_filter {
                 let file_size = if options.calculate_sizes {
@@ -514,7 +526,7 @@ fn handle_directory_artifact(
         }
     }
 
-    // Only report and remove if there are untracked files
+    // Only report and remove if there are untracked files that pass the time filter
     if !files_to_remove.is_empty() {
         // For Category 3: files are already filtered by mtime, so add size unconditionally
         total_bytes += dir_total_size;
@@ -569,8 +581,6 @@ fn handle_file_artifact(
     options: ScanOptions,
     time_ctx: &mut TimeFilterContext,
 ) -> Result<u64> {
-    time_ctx.stats.total_found += 1;
-
     // For files: check if tracked in version control
     match is_tracked_in_vcs(path) {
         VcsCheckResult::Tracked => {
@@ -594,6 +604,9 @@ fn handle_file_artifact(
             // Continue with removal
         }
     }
+
+    // This file is a candidate for removal.
+    time_ctx.stats.total_found += 1;
 
     // Extract modification time
     let modified_time = metadata.modified().ok();

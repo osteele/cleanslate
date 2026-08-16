@@ -119,6 +119,29 @@ fn test_find_project_root() {
 }
 
 #[test]
+fn test_find_project_root_recognizes_jujutsu() {
+    use std::env;
+    use std::fs;
+
+    let temp_dir = env::temp_dir().join("cleanslate_jj_test");
+    fs::remove_dir_all(&temp_dir).ok();
+    fs::create_dir_all(&temp_dir).unwrap();
+
+    let project_dir = temp_dir.join("jj_project");
+    fs::create_dir_all(&project_dir).unwrap();
+    fs::create_dir(project_dir.join(".jj")).unwrap();
+
+    let nested_file = project_dir.join("src/main.rs");
+    fs::create_dir_all(nested_file.parent().unwrap()).unwrap();
+    fs::write(&nested_file, "test").unwrap();
+
+    let root = find_project_root(&nested_file);
+    assert_eq!(root, Some(project_dir));
+
+    fs::remove_dir_all(&temp_dir).ok();
+}
+
+#[test]
 fn test_pattern_prefix_behavior() {
     // This test verifies that patterns with / prefix only match at project root
     // while patterns without / match anywhere in the path

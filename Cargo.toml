@@ -25,6 +25,7 @@ inquire = "0.9.4"
 tempfile = "3.27.0"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
+filetime = "0.2.25"
 cargo-husky = { version = "1.5.0", features = ["precommit-hook", "run-cargo-test", "run-cargo-clippy", "run-cargo-fmt"] }
 
 [profile.release]
