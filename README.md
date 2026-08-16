@@ -8,7 +8,7 @@ CleanSlate recursively examines directories to find and optionally remove build 
 - Preserves files tracked by Git or Jujutsu
 - Detects projects by looking for common project indicators
 - Groups artifacts by project
-- Optionally calculates artifact sizes
+- Calculates artifact sizes and shows each project's age
 - Filters artifacts by age or modification date
 - Excludes selected directories by name
 - Optionally deletes identified artifacts
@@ -66,10 +66,11 @@ Root-scoped patterns such as `/build` match only within directories that contain
 - **Version Control Aware**: Files tracked in Git or Jujutsu are never removed, even if they match artifact patterns
 - **VCS Directory Skip**: Skips version control directories during traversal (`.git`, `.jj`, `.svn`, `.hg`, `.bzr`, `_darcs`, `.pijul`, `CVS`, `.fossil`)
 - **Nested Repository Protection**: Skips artifact directories that contain version control metadata
-- **Fail-Closed VCS Checks**: Keeps files when their tracking status cannot be determined
+- **Fail-Closed VCS Checks**: Keeps files when their tracking status cannot be determined, and reports how many were kept for that reason
 - **Pattern-Based Selection**: Individual files must match a pattern before CleanSlate removes them. A matching recreatable directory is handled as one artifact and removed with all its contents when it has no tracked files.
 - **Symlink Safety**: Traversal does not follow symlinks. CleanSlate skips a symlink encountered as an artifact, but removing an artifact directory also removes symlink entries inside it.
-- **Dry Run Mode**: `--dry-run` previews the deletion set without removing anything
+- **Dry Run Mode**: `--dry-run` previews the deletion set without removing anything; a plain scan is also a preview, since nothing is removed without `--delete`
+- **Confirmation Required**: Deleting asks for explicit confirmation, and refuses to run at all when there is no terminal to prompt on unless `--yes` is passed
 
 ## Important Notes
 
@@ -106,8 +107,8 @@ cleanslate --dry-run
 # Show detailed list format instead of table
 cleanslate --list
 
-# Calculate artifact sizes
-cleanslate --calculate-sizes
+# Skip size calculation for a faster scan
+cleanslate --no-sizes
 
 # Show diagnostic details while scanning
 cleanslate --verbose
@@ -131,13 +132,13 @@ cleanslate --delete --yes
 - `-d, --delete`: Delete the found artifacts
 - `-y, --yes`: Skip the interactive confirmation prompt and delete all matched artifacts (requires `--delete`)
 - `-v, --verbose`: Show detailed information about found artifacts
-- `--dry-run`: Show what would be deleted without actually deleting (implies --delete)
+- `--dry-run`: Preview what would be deleted without deleting; cannot be combined with `--delete`
 - `-l, --list`: Show detailed list format instead of table (table is default)
 - `--aggressive`: Include small or trivial files such as `.DS_Store`
 - `-x, --exclude <DIR>`: Exclude directories by name; may be repeated
 - `--older-than <DURATION>`: Select artifacts older than a duration such as `48h`, `15d`, `2w`, or `3m`; plain numbers mean days
 - `--modified-before <DATE>`: Select artifacts modified before a date in `YYYY-MM-DD` format
-- `--calculate-sizes`: Calculate artifact sizes by traversing directories
+- `--no-sizes`: Skip artifact size calculation for a faster scan (sizes are calculated by default)
 - `-h, --help`: Print help
 - `-V, --version`: Print version
 
@@ -152,17 +153,25 @@ Mixed artifact directories use individual file modification times. Recreatable d
 By default, CleanSlate displays a table with these columns:
 
 - **Path**: Relative path from scan directory
+- **Removable**: Total size of the project's removable artifacts
+- **Age**: Age of the project's most recently modified artifact (`today`, `3d`, `2w`, `5mo`, `1y`; `-` when unknown)
 - **What**: Artifacts that would be removed
 
-`--calculate-sizes` adds a **Removable** column. An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
+An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
 
-`--list` displays a per-project breakdown grouped by language or tool.
+`--no-sizes` skips size calculation for a faster scan; the table then omits the size columns and ends with an artifact count instead of a total size.
+
+`--list` displays a per-project breakdown grouped by language or tool, with each project's age on its Total line.
+
+If some artifacts were skipped because their version-control status could not be determined, CleanSlate keeps them and reports the count after the report; rerun with `--verbose` to see which paths were affected.
 
 ## Interactive Deletion
 
-When `--delete` is used interactively (both stdin and stderr are TTYs), CleanSlate first scans without deleting and then presents a multi-select prompt listing every project, all pre-selected. Each line shows the project's relative path and, if `--calculate-sizes` was given, its removable size. Press `Space` to toggle selection, `Enter` to confirm, or `Esc` / `Ctrl-C` to cancel. Canceling prints "No artifacts deleted." and exits with code 0.
+When `--delete` is used interactively (both stdin and stderr are TTYs), CleanSlate first scans without deleting and then presents a multi-select prompt listing every project, all pre-selected. Each line shows the project's relative path and its removable size (omitted under `--no-sizes`). Press `Space` to toggle selection, `Enter` to confirm, or `Esc` / `Ctrl-C` to cancel.
 
-When stdin or stderr is not a TTY, `--delete` deletes everything immediately, exactly as before. Use `--delete --yes` to skip the prompt even in a TTY.
+After the multi-select, CleanSlate prints a one-line summary — `Delete N artifact(s) across M project(s), X GiB?` — and requires an explicit confirmation that defaults to "no", so a bare `Enter` declines. Declining, canceling, or selecting no projects prints "No artifacts deleted." and exits with code 0 without deleting anything.
+
+When stdin or stderr is not a TTY, `--delete` without `--yes` refuses to run rather than deleting silently. Use `--delete --yes` to skip both prompts and delete everything that matched.
 
 ## License
 

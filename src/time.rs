@@ -64,18 +64,27 @@ impl TimeFilter {
     }
 }
 
-/// Context for time-based filtering, including the filter and statistics
-pub struct TimeFilterContext<'a> {
-    pub filter: &'a TimeFilter,
-    pub stats: &'a mut TimeFilterStats,
-}
+/// Format the age of an artifact compactly and human-readably.
+/// Returns "today" for under 24 hours, then "Nd", "Nw", "Nmo", or "Ny"
+/// as the age crosses each boundary. A modification time in the future
+/// (clock skew) is treated as "today".
+pub fn format_age(modified: SystemTime, now: SystemTime) -> String {
+    const DAY_SECS: u64 = 24 * 60 * 60;
 
-/// Statistics about time-based filtering
-#[derive(Debug, Default)]
-pub struct TimeFilterStats {
-    pub total_found: usize,
-    pub passed_time_filter: usize,
-    pub excluded_by_time: usize,
+    let age = now.duration_since(modified).unwrap_or(Duration::ZERO);
+    let days = age.as_secs() / DAY_SECS;
+
+    if age.as_secs() < DAY_SECS {
+        "today".to_string()
+    } else if days < 7 {
+        format!("{}d", days)
+    } else if days < 30 {
+        format!("{}w", days / 7)
+    } else if days < 365 {
+        format!("{}mo", days / 30)
+    } else {
+        format!("{}y", days / 365)
+    }
 }
 
 /// Parse a date string in YYYY-MM-DD format to SystemTime
@@ -357,11 +366,50 @@ mod tests {
         assert!(!filter.passes(new_time));
     }
 
+    // ============ format_age tests ============
+
+    fn age_string(age_secs: u64) -> String {
+        let now = SystemTime::now();
+        format_age(now - Duration::from_secs(age_secs), now)
+    }
+
     #[test]
-    fn test_time_filter_stats_default() {
-        let stats = TimeFilterStats::default();
-        assert_eq!(stats.total_found, 0);
-        assert_eq!(stats.passed_time_filter, 0);
-        assert_eq!(stats.excluded_by_time, 0);
+    fn test_format_age_today() {
+        assert_eq!(age_string(0), "today");
+        assert_eq!(age_string(60 * 60), "today");
+        assert_eq!(age_string(23 * 60 * 60 + 59 * 60), "today");
+    }
+
+    #[test]
+    fn test_format_age_days() {
+        assert_eq!(age_string(24 * 60 * 60), "1d");
+        assert_eq!(age_string(3 * 24 * 60 * 60), "3d");
+        assert_eq!(age_string(6 * 24 * 60 * 60), "6d");
+    }
+
+    #[test]
+    fn test_format_age_weeks() {
+        assert_eq!(age_string(7 * 24 * 60 * 60), "1w");
+        assert_eq!(age_string(2 * 7 * 24 * 60 * 60), "2w");
+        assert_eq!(age_string(29 * 24 * 60 * 60), "4w");
+    }
+
+    #[test]
+    fn test_format_age_months() {
+        assert_eq!(age_string(30 * 24 * 60 * 60), "1mo");
+        assert_eq!(age_string(5 * 30 * 24 * 60 * 60), "5mo");
+        assert_eq!(age_string(364 * 24 * 60 * 60), "12mo");
+    }
+
+    #[test]
+    fn test_format_age_years() {
+        assert_eq!(age_string(365 * 24 * 60 * 60), "1y");
+        assert_eq!(age_string(2 * 365 * 24 * 60 * 60), "2y");
+    }
+
+    #[test]
+    fn test_format_age_future_is_today() {
+        let now = SystemTime::now();
+        assert_eq!(format_age(now + Duration::from_secs(60), now), "today");
     }
 }

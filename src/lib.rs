@@ -26,7 +26,7 @@ pub use patterns::{
 };
 pub use scanner::{
     find_project_root, scan_single_path, truncate_name_with_suffix, ArtifactEntry, ProjectReport,
-    ScanOptions, ScanResult,
+    ScanOptions, ScanResult, ScanStats, TimeFilterContext,
 };
-pub use time::{TimeFilter, TimeFilterContext, TimeFilterStats};
+pub use time::{format_age, TimeFilter};
 pub use vcs::{detect_vcs, VcsCheckResult, VcsType};

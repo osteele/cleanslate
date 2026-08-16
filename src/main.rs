@@ -1,17 +1,18 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use cleanslate::{
-    execute_plan, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
-    ExecutionSummary, ProjectReport, ScanOptions, ScanResult, TimeFilter, TimeFilterStats,
+    execute_plan, format_age, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
+    ExecutionSummary, ProjectReport, ScanOptions, ScanResult, ScanStats, TimeFilter,
 };
 use colored::Colorize;
 use humansize::{format_size, BINARY};
-use inquire::MultiSelect;
+use inquire::{Confirm, MultiSelect};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     io::IsTerminal,
     path::PathBuf,
+    time::SystemTime,
 };
 
 #[derive(Parser, Debug)]
@@ -64,8 +65,12 @@ struct Args {
     #[arg(long, value_name = "DATE")]
     modified_before: Option<String>,
 
-    /// Calculate sizes of artifacts (slower, requires traversing directories)
+    /// Skip artifact size calculation for a faster scan
     #[arg(long)]
+    no_sizes: bool,
+
+    /// Deprecated: sizes are calculated by default; this flag is ignored
+    #[arg(long, hide = true)]
     calculate_sizes: bool,
 }
 
@@ -131,13 +136,14 @@ fn scan_for_artifacts(
     // Merge results from parallel scans
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut total_bytes: u64 = 0;
-    let mut combined_stats = TimeFilterStats::default();
+    let mut combined_stats = ScanStats::default();
 
     for result in results {
         total_bytes += result.total_bytes;
         combined_stats.total_found += result.stats.total_found;
         combined_stats.passed_time_filter += result.stats.passed_time_filter;
         combined_stats.excluded_by_time += result.stats.excluded_by_time;
+        combined_stats.vcs_check_failures += result.stats.vcs_check_failures;
         for (project_path, project_report) in result.projects {
             projects
                 .entry(project_path)
@@ -165,8 +171,31 @@ struct Report<'a> {
     unique_paths: &'a [PathBuf],
     time_filter: &'a TimeFilter,
     total_bytes: u64,
-    stats: &'a TimeFilterStats,
+    stats: &'a ScanStats,
     calculate_sizes: bool,
+    now: SystemTime,
+}
+
+/// Age of the project's most recently modified artifact, formatted for display.
+/// The freshest artifact is the conservative signal for whether a project is still in use.
+fn project_age_display(project_report: &ProjectReport, now: SystemTime) -> String {
+    project_report
+        .artifacts
+        .iter()
+        .filter_map(|a| a.modified)
+        .max()
+        .map(|modified| format_age(modified, now))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+/// Warn when artifacts were kept because their VCS status could not be determined
+fn print_vcs_failure_notice(stats: &ScanStats, verbose: bool) {
+    if stats.vcs_check_failures > 0 && !verbose {
+        eprintln!(
+            "{} artifact(s) skipped because their version-control status could not be determined; rerun with --verbose for details.",
+            stats.vcs_check_failures
+        );
+    }
 }
 
 /// CLI arguments needed to reproduce this scan as a deletion command
@@ -248,7 +277,8 @@ fn display_table_format(report: &Report) {
         120
     };
 
-    // Calculate max path width for alignment
+    // Calculate max path width for alignment. The "Path" header and the "Total"
+    // label share this column, so the width must accommodate them too.
     let max_path_width = sorted_projects
         .iter()
         .map(|(path, _)| {
@@ -260,54 +290,66 @@ fn display_table_format(report: &Report) {
         })
         .max()
         .unwrap_or(20)
-        .min(40); // Cap path width at 40 chars
+        .min(40) // Cap path width at 40 chars
+        .max("Total".len());
 
-    // Fixed widths for size columns (only if calculate_sizes is enabled)
+    // Fixed widths for the size columns (only if sizes are shown) and the Age column
     let removable_width = if report.calculate_sizes { 12 } else { 0 };
     let too_recent_width = if report.calculate_sizes && time_filter.is_active() {
         12
     } else {
         0
     };
+    let age_width = 5;
 
     // Calculate What column width
     let separator_width = if report.calculate_sizes {
         if time_filter.is_active() {
-            6
+            8
         } else {
-            4
+            6
         }
     } else {
-        2 // Just "Path  What"
+        4 // "Path  Age  What"
     };
     let what_width = terminal_width
         .saturating_sub(max_path_width)
         .saturating_sub(removable_width)
         .saturating_sub(too_recent_width)
+        .saturating_sub(age_width)
         .saturating_sub(separator_width)
         .max(20);
 
-    // Print header - hide size columns when not calculated
+    // Print header - hide size columns when sizes were not calculated
     if !report.calculate_sizes {
-        // No size columns
-        println!("{:<path_w$}  What", "Path", path_w = max_path_width);
+        println!(
+            "{:<path_w$}  {:>age_w$}  What",
+            "Path",
+            "Age",
+            path_w = max_path_width,
+            age_w = age_width
+        );
     } else if time_filter.is_active() {
         println!(
-            "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  What",
+            "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>age_w$}  What",
             "Path",
             "Removable",
             "Too Recent",
+            "Age",
             path_w = max_path_width,
             rem_w = removable_width,
-            rec_w = too_recent_width
+            rec_w = too_recent_width,
+            age_w = age_width
         );
     } else {
         println!(
-            "{:<path_w$}  {:>rem_w$}  What",
+            "{:<path_w$}  {:>rem_w$}  {:>age_w$}  What",
             "Path",
             "Removable",
+            "Age",
             path_w = max_path_width,
-            rem_w = removable_width
+            rem_w = removable_width,
+            age_w = age_width
         );
     }
     println!("{}", "─".repeat(terminal_width.min(120)));
@@ -404,15 +446,18 @@ fn display_table_format(report: &Report) {
         }
 
         let what_display = what_parts.join(", ");
+        let age_display = project_age_display(project_report, report.now);
 
-        // Print row based on whether sizes are calculated
+        // Print row based on whether sizes were calculated
         if !report.calculate_sizes {
-            // No size columns - just path and what
+            // No size columns - just path, age, and what
             println!(
-                "{:<path_w$}  {}",
+                "{:<path_w$}  {:>age_w$}  {}",
                 path_display,
+                age_display,
                 what_display,
-                path_w = max_path_width
+                path_w = max_path_width,
+                age_w = age_width
             );
         } else {
             // Apply styling based on thresholds
@@ -431,23 +476,27 @@ fn display_table_format(report: &Report) {
 
             if time_filter.is_active() {
                 println!(
-                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {}",
+                    "{:<path_w$}  {:>rem_w$}  {:>rec_w$}  {:>age_w$}  {}",
                     path_styled,
                     removable_display,
                     format_size(too_recent_size, BINARY),
+                    age_display,
                     what_display,
                     path_w = max_path_width,
                     rem_w = removable_width,
-                    rec_w = too_recent_width
+                    rec_w = too_recent_width,
+                    age_w = age_width
                 );
             } else {
                 println!(
-                    "{:<path_w$}  {:>rem_w$}  {}",
+                    "{:<path_w$}  {:>rem_w$}  {:>age_w$}  {}",
                     path_styled,
                     removable_display,
+                    age_display,
                     what_display,
                     path_w = max_path_width,
-                    rem_w = removable_width
+                    rem_w = removable_width,
+                    age_w = age_width
                 );
             }
         }
@@ -459,7 +508,7 @@ fn display_table_format(report: &Report) {
     if !report.calculate_sizes {
         // Show count of projects and artifacts instead of sizes
         println!(
-            "\nFound {} artifact(s) across {} project(s). Use --calculate-sizes to see sizes.",
+            "\nFound {} artifact(s) across {} project(s).",
             total_artifact_count,
             sorted_projects.len()
         );
@@ -574,15 +623,17 @@ fn display_list_format(report: &Report) {
 
         if report.time_filter.is_active() && too_recent_size > 0 {
             println!(
-                "  {} (Removable: {}, Too Recent: {})",
+                "  {} (Removable: {}, Too Recent: {}, Age: {})",
                 format!("Total: {}", format_size(total_project_size, BINARY)).green(),
                 format_size(removable_size, BINARY),
-                format_size(too_recent_size, BINARY)
+                format_size(too_recent_size, BINARY),
+                project_age_display(project_report, report.now)
             );
         } else {
             println!(
-                "  {}",
-                format!("Total: {}", format_size(total_project_size, BINARY)).green()
+                "  {} (Age: {})",
+                format!("Total: {}", format_size(total_project_size, BINARY)).green(),
+                project_age_display(project_report, report.now)
             );
         }
         println!(); // Add a blank line between projects
@@ -699,6 +750,27 @@ fn select_projects_interactively(
     Ok(Some(selected_paths))
 }
 
+/// Build the final confirmation prompt shown after interactive project selection.
+/// `total_bytes` is None when sizes were not calculated.
+fn confirmation_prompt(
+    artifact_count: usize,
+    project_count: usize,
+    total_bytes: Option<u64>,
+) -> String {
+    match total_bytes {
+        Some(bytes) => format!(
+            "Delete {} artifact(s) across {} project(s), {}?",
+            artifact_count,
+            project_count,
+            format_size(bytes, BINARY)
+        ),
+        None => format!(
+            "Delete {} artifact(s) across {} project(s)?",
+            artifact_count, project_count
+        ),
+    }
+}
+
 /// Print the outcome of a deletion run (instead of redisplaying the scan table)
 fn print_execution_summary(
     projects: &HashMap<PathBuf, ProjectReport>,
@@ -735,6 +807,13 @@ fn print_execution_summary(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.calculate_sizes {
+        eprintln!("cleanslate: --calculate-sizes is now the default; the flag is ignored");
+    }
+    let calculate_sizes = !args.no_sizes;
+    // Captured once so every displayed age is relative to the same instant
+    let now = SystemTime::now();
+
     // Deletion without --yes requires an interactive confirmation prompt; refuse when
     // there is no terminal to prompt on rather than deleting silently.
     if args.delete
@@ -750,7 +829,7 @@ fn main() -> Result<()> {
     // Stage 1: scan (pure - never deletes)
     let options = ScanOptions {
         verbose: args.verbose,
-        calculate_sizes: args.calculate_sizes,
+        calculate_sizes,
     };
     let (mut result, unique_paths) = scan_for_artifacts(
         &args.paths,
@@ -769,13 +848,15 @@ fn main() -> Result<()> {
         time_filter: &time_filter,
         total_bytes: result.total_bytes,
         stats: &result.stats,
-        calculate_sizes: args.calculate_sizes,
+        calculate_sizes,
+        now,
     };
 
     // Preview modes: a plain scan IS the preview; --dry-run is the same preview
     // without the deletion hint.
     if !args.delete {
         display_results(&report, args.list);
+        print_vcs_failure_notice(&result.stats, args.verbose);
         if args.dry_run {
             println!("Dry run: no files were deleted.");
         } else if has_removable_artifacts(&result.projects) {
@@ -796,6 +877,7 @@ fn main() -> Result<()> {
         .all(|report| report.artifacts.is_empty())
     {
         display_results(&report, args.list);
+        print_vcs_failure_notice(&result.stats, args.verbose);
         return Ok(());
     }
 
@@ -803,8 +885,7 @@ fn main() -> Result<()> {
     let selected = if args.yes {
         result.projects.keys().cloned().collect()
     } else {
-        match select_projects_interactively(&result.projects, &unique_paths, args.calculate_sizes)?
-        {
+        match select_projects_interactively(&result.projects, &unique_paths, calculate_sizes)? {
             Some(selected) => selected,
             None => {
                 println!("No artifacts deleted.");
@@ -813,9 +894,50 @@ fn main() -> Result<()> {
         }
     };
 
+    if selected.is_empty() {
+        println!("No artifacts deleted.");
+        return Ok(());
+    }
+
+    // A bare Enter at the multi-select would otherwise delete everything, so
+    // require an explicit confirmation (default: no) before executing.
+    if !args.yes {
+        let mut artifact_count = 0usize;
+        let mut selected_bytes = 0u64;
+        for (path, project_report) in &result.projects {
+            if selected.contains(path) {
+                for artifact in &project_report.artifacts {
+                    if !artifact.time_filtered {
+                        artifact_count += 1;
+                        selected_bytes += artifact.size;
+                    }
+                }
+            }
+        }
+        let prompt = confirmation_prompt(
+            artifact_count,
+            selected.len(),
+            if calculate_sizes {
+                Some(selected_bytes)
+            } else {
+                None
+            },
+        );
+        let confirmed = match Confirm::new(&prompt).with_default(false).prompt() {
+            Ok(answer) => answer,
+            Err(inquire::InquireError::OperationCanceled)
+            | Err(inquire::InquireError::OperationInterrupted) => false,
+            Err(err) => return Err(err.into()),
+        };
+        if !confirmed {
+            println!("No artifacts deleted.");
+            return Ok(());
+        }
+    }
+
     // Stage 3: execute (the only stage that deletes)
     let summary = execute_plan(&mut result.projects, &selected, args.verbose);
-    print_execution_summary(&result.projects, &selected, &summary, args.calculate_sizes);
+    print_execution_summary(&result.projects, &selected, &summary, calculate_sizes);
 
     if summary.failures > 0 {
         std::process::exit(1);
@@ -826,8 +948,20 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::remove_overlapping_paths;
+    use super::{confirmation_prompt, remove_overlapping_paths};
     use std::path::PathBuf;
+
+    #[test]
+    fn confirmation_prompt_includes_size_when_calculated() {
+        let prompt = confirmation_prompt(3, 1, Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(prompt, "Delete 3 artifact(s) across 1 project(s), 2 GiB?");
+    }
+
+    #[test]
+    fn confirmation_prompt_omits_size_without_calculated_sizes() {
+        let prompt = confirmation_prompt(3, 2, None);
+        assert_eq!(prompt, "Delete 3 artifact(s) across 2 project(s)?");
+    }
 
     #[test]
     fn overlapping_scan_paths_keep_only_the_ancestor() {

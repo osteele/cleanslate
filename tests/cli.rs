@@ -72,9 +72,9 @@ fn test_delete_flag_dry_run() {
 
     // First, check what would be deleted without actually deleting
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd.arg(dir.path()).assert();
+    let assert = cmd.arg(dir.path()).arg("--no-sizes").assert();
 
-    // Without --calculate-sizes, should show artifact count message instead of "Total" row
+    // With --no-sizes, should show artifact count message instead of "Total" row
     assert
         .success()
         .stdout(predicate::str::contains("Found").and(predicate::str::contains("artifact")));
@@ -331,14 +331,14 @@ fn test_non_project_directory_with_artifacts() {
         .stdout(predicate::str::contains("__pycache__"));
 }
 
-/// Test that --list mode works without --calculate-sizes (Fix #2)
+/// Test that --list mode shows artifacts (Fix #2)
 /// Previously, list mode filtered out projects with zero size, which meant
-/// directory artifacts weren't shown unless --calculate-sizes was also passed.
+/// directory artifacts weren't shown unless size calculation was also enabled.
 #[test]
 fn test_list_mode_without_calculate_sizes() {
     let dir = setup_test_directory();
 
-    // Run with --list but without --calculate-sizes
+    // Run with --list
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
     let assert = cmd.arg(dir.path()).arg("--list").assert();
 
@@ -454,7 +454,7 @@ fn test_selective_deletion_pass_only_removes_selected_projects() {
     let mut result = ScanResult {
         projects,
         total_bytes: 2,
-        stats: cleanslate::TimeFilterStats::default(),
+        stats: cleanslate::ScanStats::default(),
     };
 
     let selected: HashSet<std::path::PathBuf> = [project_a.clone()].into_iter().collect();
@@ -540,4 +540,132 @@ fn test_plain_scan_shows_artifacts_and_delete_hint() {
     assert!(dir.path().join("node_modules").exists());
     assert!(dir.path().join("__pycache__").exists());
     assert!(dir.path().join("target").exists());
+}
+
+/// Sizes are on by default: a plain scan shows the Removable column and a
+/// Total row without any size flag.
+#[test]
+fn test_sizes_on_by_default() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removable"))
+        .stdout(predicate::str::contains("Age"))
+        .stdout(predicate::str::contains("Total"))
+        .stdout(predicate::str::contains("--calculate-sizes").not());
+}
+
+/// The Total row shares the path column with project rows, so a short project
+/// path must not shift the Total row's size value out of alignment.
+#[test]
+fn test_total_row_size_column_aligns_with_project_rows() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd.arg(dir.path()).output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    let removable_end = |line: &str| {
+        let start = line.find("iB").or_else(|| line.find(" B"))?;
+        Some(start + 2)
+    };
+
+    let project_row = stdout
+        .lines()
+        .find(|line| line.starts_with('.'))
+        .expect("expected a project row for the scanned root");
+    let total_row = stdout
+        .lines()
+        .find(|line| line.starts_with("Total"))
+        .expect("expected a Total row");
+
+    assert_eq!(
+        removable_end(project_row),
+        removable_end(total_row),
+        "Removable column misaligned:\nproject: {:?}\ntotal:   {:?}",
+        project_row,
+        total_row
+    );
+}
+
+/// --no-sizes omits the size columns and prints the artifact-count footer.
+#[test]
+fn test_no_sizes_omits_size_columns() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--no-sizes").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removable").not())
+        .stdout(predicate::str::contains("Total").not())
+        .stdout(
+            predicate::str::contains("Found").and(predicate::str::contains("artifact(s) across")),
+        )
+        .stdout(predicate::str::contains("--calculate-sizes").not());
+}
+
+/// --calculate-sizes still works as a hidden deprecated alias and prints a
+/// deprecation notice to stderr.
+#[test]
+fn test_calculate_sizes_deprecated_alias() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--calculate-sizes").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removable"))
+        .stderr(predicate::str::contains(
+            "cleanslate: --calculate-sizes is now the default; the flag is ignored",
+        ));
+}
+
+/// --delete --yes deletes non-interactively: no confirmation prompt is shown.
+#[test]
+fn test_delete_yes_skips_confirmation_prompt() {
+    let dir = setup_test_directory();
+
+    assert!(dir.path().join("node_modules").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--delete").arg("--yes").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removed"))
+        .stdout(predicate::str::contains("artifact(s) across"))
+        // The confirmation question must not appear when --yes is given
+        .stdout(predicate::str::contains("?").not())
+        .stderr(predicate::str::contains("?").not());
+
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(!dir.path().join("__pycache__").exists());
+    assert!(!dir.path().join("target").exists());
+}
+
+/// When a VCS check fails and artifacts are skipped to be safe, a non-verbose
+/// run reports how many were skipped.
+#[test]
+fn test_vcs_failure_notice_without_verbose() {
+    let dir = tempdir().unwrap();
+    // An empty .git directory makes `git ls-files` fail, so the tracking
+    // status of stale.log cannot be determined and it is skipped to be safe.
+    fs::create_dir(dir.path().join(".git")).unwrap();
+    fs::write(dir.path().join("stale.log"), "log").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).assert();
+
+    assert.success().stderr(predicate::str::contains(
+        "artifact(s) skipped because their version-control status could not be determined; rerun with --verbose for details.",
+    ));
+
+    assert!(dir.path().join("stale.log").exists());
 }

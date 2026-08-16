@@ -3,7 +3,7 @@
 use crate::patterns::{
     is_project_root, is_recreatable_dir, matching_pattern, ArtifactPattern, ArtifactType,
 };
-use crate::time::{TimeFilter, TimeFilterContext, TimeFilterStats};
+use crate::time::TimeFilter;
 use crate::vcs::{
     detect_vcs, get_tracked_files_batch, has_tracked_files, is_tracked_in_vcs, VcsCheckResult,
     VCS_INTERNALS,
@@ -28,12 +28,27 @@ pub struct ScanOptions {
     pub calculate_sizes: bool,
 }
 
+/// Statistics gathered during a scan
+#[derive(Debug, Default)]
+pub struct ScanStats {
+    pub total_found: usize,
+    pub passed_time_filter: usize,
+    pub excluded_by_time: usize,
+    /// Paths skipped because their VCS tracking status could not be determined
+    pub vcs_check_failures: usize,
+}
+
+/// Context for time-based filtering, including the filter and scan statistics
+pub struct TimeFilterContext<'a> {
+    pub filter: &'a TimeFilter,
+    pub stats: &'a mut ScanStats,
+}
+
 /// An artifact entry found during scanning
 pub struct ArtifactEntry {
     pub path: PathBuf,
     pub size: u64,
     pub removed: bool,
-    #[allow(dead_code)]
     pub modified: Option<SystemTime>,
     pub time_filtered: bool,
     /// Language name from the pattern that matched this artifact (e.g., "Python")
@@ -53,7 +68,7 @@ pub struct ProjectReport {
 pub struct ScanResult {
     pub projects: HashMap<PathBuf, ProjectReport>,
     pub total_bytes: u64,
-    pub stats: TimeFilterStats,
+    pub stats: ScanStats,
 }
 
 /// Calculate total size of a directory (all files, not just artifacts)
@@ -186,6 +201,7 @@ fn handle_directory_artifact(
             return Ok(0);
         }
         Err(error) => {
+            time_ctx.stats.vcs_check_failures += 1;
             if options.verbose {
                 eprintln!(
                     "Warning: Could not inspect {} for nested repositories: {}, skipping to be safe",
@@ -219,6 +235,7 @@ fn handle_directory_artifact(
             }
             None => {
                 // VCS check failed - skip removal to be safe
+                time_ctx.stats.vcs_check_failures += 1;
                 if options.verbose {
                     eprintln!(
                         "Warning: VCS check failed for {}, skipping to be safe",
@@ -310,6 +327,7 @@ fn handle_directory_artifact(
         Ok(files) => files,
         Err(e) => {
             // VCS check failed - skip this directory to be safe
+            time_ctx.stats.vcs_check_failures += 1;
             if options.verbose {
                 eprintln!(
                     "Warning: VCS check failed for {}: {}, skipping to be safe",
@@ -438,6 +456,7 @@ fn handle_file_artifact(
         }
         VcsCheckResult::Unknown(e) => {
             // VCS check failed - skip removal to be safe
+            time_ctx.stats.vcs_check_failures += 1;
             if options.verbose {
                 eprintln!(
                     "Warning: VCS check failed for {}: {}, skipping to be safe",
@@ -643,7 +662,7 @@ fn scan_project_for_artifacts(
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let skip_paths = Arc::new(Mutex::new(HashSet::<PathBuf>::new()));
     let mut total_bytes: u64 = 0;
-    let mut stats = TimeFilterStats::default();
+    let mut stats = ScanStats::default();
 
     // Canonicalize the project root
     let project_root = project_root.canonicalize().unwrap_or(project_root);
@@ -828,13 +847,14 @@ pub fn scan_single_path(
     // Merge results from parallel processing
     let mut projects: HashMap<PathBuf, ProjectReport> = HashMap::new();
     let mut total_bytes: u64 = 0;
-    let mut stats = TimeFilterStats::default();
+    let mut stats = ScanStats::default();
 
     for result in results {
         total_bytes += result.total_bytes;
         stats.total_found += result.stats.total_found;
         stats.passed_time_filter += result.stats.passed_time_filter;
         stats.excluded_by_time += result.stats.excluded_by_time;
+        stats.vcs_check_failures += result.stats.vcs_check_failures;
 
         for (project_path, project_report) in result.projects {
             projects
