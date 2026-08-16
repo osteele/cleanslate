@@ -385,8 +385,75 @@ fn test_delete_non_tty_without_yes_refuses() {
     let assert = cmd.write_stdin("").assert();
 
     assert.failure().stderr(predicate::str::contains(
-        "refusing to delete without confirmation",
+        "refusing to delete without a confirmation prompt",
     ));
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+}
+
+#[test]
+fn test_delete_no_prompt_without_yes_refuses() {
+    let dir = setup_test_directory();
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd
+        .arg(dir.path())
+        .arg("--delete")
+        .arg("--no-prompt")
+        .assert();
+
+    assert.failure().stderr(predicate::str::contains(
+        "refusing to delete without a confirmation prompt",
+    ));
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+}
+
+#[test]
+fn test_delete_yes_no_prompt_still_deletes() {
+    let dir = setup_test_directory();
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd
+        .arg(dir.path())
+        .arg("--delete")
+        .arg("--yes")
+        .arg("--no-prompt")
+        .assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Removed"))
+        .stdout(predicate::str::contains("artifact(s) across"));
+
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(!dir.path().join("__pycache__").exists());
+    assert!(!dir.path().join("target").exists());
+}
+
+#[test]
+fn test_plain_scan_no_prompt_prints_delete_hint_and_deletes_nothing() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--no-prompt").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("To delete: cleanslate --delete"))
+        .stdout(predicate::str::contains("No artifacts deleted.").not());
 
     assert!(dir.path().join("node_modules").exists());
     assert!(dir.path().join("__pycache__").exists());
@@ -668,4 +735,42 @@ fn test_vcs_failure_notice_without_verbose() {
     ));
 
     assert!(dir.path().join("stale.log").exists());
+}
+
+/// Regression test: a plain scan with piped/redirected stdout must stay
+/// scriptable and print the deletion hint instead of prompting.
+#[test]
+fn test_plain_scan_piped_stdout_prints_delete_hint_and_deletes_nothing() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("To delete: cleanslate --delete"))
+        .stdout(predicate::str::contains("No artifacts deleted.").not());
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+}
+
+/// Regression test: --dry-run with piped output previews the report, prints
+/// the dry-run line, and does not suggest an interactive deletion command.
+#[test]
+fn test_dry_run_piped_output_prints_dry_run_line_and_no_hint() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--dry-run").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Dry run: no files were deleted."))
+        .stdout(predicate::str::contains("To delete:").not());
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
 }

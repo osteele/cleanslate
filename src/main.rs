@@ -6,7 +6,7 @@ use cleanslate::{
 };
 use colored::Colorize;
 use humansize::{format_size, BINARY};
-use inquire::{Confirm, MultiSelect};
+use inquire::{MultiSelect, Select};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -34,6 +34,10 @@ struct Args {
     /// Skip the interactive confirmation prompt and delete all matched artifacts
     #[arg(long, short, requires = "delete")]
     yes: bool,
+
+    /// Never prompt; behave as if the session were not interactive
+    #[arg(long)]
+    no_prompt: bool,
 
     /// Show detailed information about found artifacts
     #[arg(long, short)]
@@ -676,6 +680,31 @@ fn has_removable_artifacts(projects: &HashMap<PathBuf, ProjectReport>) -> bool {
         .any(|report| report.artifacts.iter().any(|a| !a.time_filtered))
 }
 
+/// Decide whether a plain scan should offer to delete interactively.
+fn should_offer_deletion(
+    delete: bool,
+    dry_run: bool,
+    no_prompt: bool,
+    stdout_tty: bool,
+    stdin_tty: bool,
+    stderr_tty: bool,
+    has_removable: bool,
+) -> bool {
+    !delete && !dry_run && !no_prompt && stdout_tty && stdin_tty && stderr_tty && has_removable
+}
+
+/// Decide whether a `--delete` run without `--yes` must be refused because there
+/// is no terminal to prompt on or `--no-prompt` was requested.
+fn should_refuse_non_interactive_delete(
+    delete: bool,
+    yes: bool,
+    no_prompt: bool,
+    stdin_tty: bool,
+    stderr_tty: bool,
+) -> bool {
+    delete && !yes && (no_prompt || !stdin_tty || !stderr_tty)
+}
+
 /// Prompt the user to select which projects to clean. Returns None if the prompt is canceled.
 fn select_projects_interactively(
     projects: &HashMap<PathBuf, ProjectReport>,
@@ -804,6 +833,97 @@ fn print_execution_summary(
     }
 }
 
+/// The three-way choice presented in the single interactive deletion prompt.
+enum InitialDeletionChoice {
+    No,
+    YesDeleteAll,
+    ChooseProjects,
+}
+
+impl std::fmt::Display for InitialDeletionChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InitialDeletionChoice::No => write!(f, "No"),
+            InitialDeletionChoice::YesDeleteAll => write!(f, "Yes, delete all"),
+            InitialDeletionChoice::ChooseProjects => write!(f, "Choose projects…"),
+        }
+    }
+}
+
+/// Outcome of the interactive deletion flow shared by `--delete` and a plain
+/// terminal scan that offers to delete.
+enum DeletionFlowOutcome {
+    /// The user cancelled, selected nothing, or declined the confirmation.
+    Cancelled,
+    /// Deletion was executed; the summary is returned.
+    Deleted(ExecutionSummary),
+}
+
+/// Prompt, execute, and summarize deletion. This is the single path used for
+/// both `--delete` and a plain scan that offers to delete interactively.
+fn run_interactive_deletion(
+    projects: &mut HashMap<PathBuf, ProjectReport>,
+    unique_paths: &[PathBuf],
+    calculate_sizes: bool,
+    yes: bool,
+    verbose: bool,
+) -> Result<DeletionFlowOutcome> {
+    let selected = if yes {
+        projects.keys().cloned().collect()
+    } else {
+        let artifact_count = projects
+            .values()
+            .flat_map(|report| &report.artifacts)
+            .filter(|artifact| !artifact.time_filtered)
+            .count();
+        let total_bytes = if calculate_sizes {
+            Some(
+                projects
+                    .values()
+                    .flat_map(|report| &report.artifacts)
+                    .filter(|artifact| !artifact.time_filtered)
+                    .map(|artifact| artifact.size)
+                    .sum(),
+            )
+        } else {
+            None
+        };
+        let prompt = confirmation_prompt(artifact_count, projects.len(), total_bytes);
+        let options = vec![
+            InitialDeletionChoice::No,
+            InitialDeletionChoice::YesDeleteAll,
+            InitialDeletionChoice::ChooseProjects,
+        ];
+        let choice = match Select::new(&prompt, options).prompt() {
+            Ok(choice) => choice,
+            Err(inquire::InquireError::OperationCanceled)
+            | Err(inquire::InquireError::OperationInterrupted) => {
+                return Ok(DeletionFlowOutcome::Cancelled);
+            }
+            Err(err) => return Err(err.into()),
+        };
+        match choice {
+            InitialDeletionChoice::No => return Ok(DeletionFlowOutcome::Cancelled),
+            InitialDeletionChoice::YesDeleteAll => projects.keys().cloned().collect(),
+            InitialDeletionChoice::ChooseProjects => {
+                match select_projects_interactively(projects, unique_paths, calculate_sizes)? {
+                    Some(selected) => selected,
+                    None => return Ok(DeletionFlowOutcome::Cancelled),
+                }
+            }
+        }
+    };
+
+    if selected.is_empty() {
+        return Ok(DeletionFlowOutcome::Cancelled);
+    }
+
+    let summary = execute_plan(projects, &selected, verbose);
+    print_execution_summary(projects, &selected, &summary, calculate_sizes);
+
+    Ok(DeletionFlowOutcome::Deleted(summary))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -815,13 +935,16 @@ fn main() -> Result<()> {
     let now = SystemTime::now();
 
     // Deletion without --yes requires an interactive confirmation prompt; refuse when
-    // there is no terminal to prompt on rather than deleting silently.
-    if args.delete
-        && !args.yes
-        && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal())
-    {
+    // there is no terminal to prompt on or when --no-prompt was requested.
+    if should_refuse_non_interactive_delete(
+        args.delete,
+        args.yes,
+        args.no_prompt,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
         eprintln!(
-            "cleanslate: refusing to delete without confirmation in a non-interactive session; pass --yes to confirm"
+            "cleanslate: refusing to delete without a confirmation prompt; pass --yes to confirm"
         );
         std::process::exit(1);
     }
@@ -853,13 +976,39 @@ fn main() -> Result<()> {
     };
 
     // Preview modes: a plain scan IS the preview; --dry-run is the same preview
-    // without the deletion hint.
+    // without the deletion hint. When running in a terminal, a plain scan can
+    // also offer to enter the same interactive deletion path that --delete uses.
+    let has_removable = has_removable_artifacts(&result.projects);
+
     if !args.delete {
         display_results(&report, args.list);
         print_vcs_failure_notice(&result.stats, args.verbose);
         if args.dry_run {
             println!("Dry run: no files were deleted.");
-        } else if has_removable_artifacts(&result.projects) {
+        } else if should_offer_deletion(
+            args.delete,
+            args.dry_run,
+            args.no_prompt,
+            std::io::stdout().is_terminal(),
+            std::io::stdin().is_terminal(),
+            std::io::stderr().is_terminal(),
+            has_removable,
+        ) {
+            match run_interactive_deletion(
+                &mut result.projects,
+                &unique_paths,
+                calculate_sizes,
+                args.yes,
+                args.verbose,
+            )? {
+                DeletionFlowOutcome::Cancelled => println!("No artifacts deleted."),
+                DeletionFlowOutcome::Deleted(summary) => {
+                    if summary.failures > 0 {
+                        std::process::exit(1);
+                    }
+                }
+            }
+        } else if has_removable {
             print_delete_command(&DeleteCommand {
                 paths: &args.paths,
                 older_than: &args.older_than,
@@ -881,66 +1030,19 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Stage 2: select which projects to clean
-    let selected = if args.yes {
-        result.projects.keys().cloned().collect()
-    } else {
-        match select_projects_interactively(&result.projects, &unique_paths, calculate_sizes)? {
-            Some(selected) => selected,
-            None => {
-                println!("No artifacts deleted.");
-                return Ok(());
+    match run_interactive_deletion(
+        &mut result.projects,
+        &unique_paths,
+        calculate_sizes,
+        args.yes,
+        args.verbose,
+    )? {
+        DeletionFlowOutcome::Cancelled => println!("No artifacts deleted."),
+        DeletionFlowOutcome::Deleted(summary) => {
+            if summary.failures > 0 {
+                std::process::exit(1);
             }
         }
-    };
-
-    if selected.is_empty() {
-        println!("No artifacts deleted.");
-        return Ok(());
-    }
-
-    // A bare Enter at the multi-select would otherwise delete everything, so
-    // require an explicit confirmation (default: no) before executing.
-    if !args.yes {
-        let mut artifact_count = 0usize;
-        let mut selected_bytes = 0u64;
-        for (path, project_report) in &result.projects {
-            if selected.contains(path) {
-                for artifact in &project_report.artifacts {
-                    if !artifact.time_filtered {
-                        artifact_count += 1;
-                        selected_bytes += artifact.size;
-                    }
-                }
-            }
-        }
-        let prompt = confirmation_prompt(
-            artifact_count,
-            selected.len(),
-            if calculate_sizes {
-                Some(selected_bytes)
-            } else {
-                None
-            },
-        );
-        let confirmed = match Confirm::new(&prompt).with_default(false).prompt() {
-            Ok(answer) => answer,
-            Err(inquire::InquireError::OperationCanceled)
-            | Err(inquire::InquireError::OperationInterrupted) => false,
-            Err(err) => return Err(err.into()),
-        };
-        if !confirmed {
-            println!("No artifacts deleted.");
-            return Ok(());
-        }
-    }
-
-    // Stage 3: execute (the only stage that deletes)
-    let summary = execute_plan(&mut result.projects, &selected, args.verbose);
-    print_execution_summary(&result.projects, &selected, &summary, calculate_sizes);
-
-    if summary.failures > 0 {
-        std::process::exit(1);
     }
 
     Ok(())
@@ -948,7 +1050,10 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{confirmation_prompt, remove_overlapping_paths};
+    use super::{
+        confirmation_prompt, remove_overlapping_paths, should_offer_deletion,
+        should_refuse_non_interactive_delete,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -976,5 +1081,84 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(&PathBuf::from("/workspace/project")));
         assert!(result.contains(&PathBuf::from("/workspace/other")));
+    }
+
+    #[test]
+    fn should_offer_deletion_when_all_conditions_hold() {
+        assert!(should_offer_deletion(
+            false, false, false, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn should_not_offer_deletion_when_delete_is_passed() {
+        assert!(!should_offer_deletion(
+            true, false, false, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn should_not_offer_deletion_when_dry_run_is_passed() {
+        assert!(!should_offer_deletion(
+            false, true, false, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn should_not_offer_deletion_when_no_prompt_is_passed() {
+        assert!(!should_offer_deletion(
+            false, false, true, true, true, true, true
+        ));
+    }
+
+    #[test]
+    fn should_not_offer_deletion_when_any_stream_is_not_a_tty() {
+        assert!(!should_offer_deletion(
+            false, false, false, false, true, true, true
+        ));
+        assert!(!should_offer_deletion(
+            false, false, false, true, false, true, true
+        ));
+        assert!(!should_offer_deletion(
+            false, false, false, true, true, false, true
+        ));
+    }
+
+    #[test]
+    fn should_not_offer_deletion_when_nothing_is_removable() {
+        assert!(!should_offer_deletion(
+            false, false, false, true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn should_refuse_non_interactive_delete_when_no_prompt() {
+        assert!(should_refuse_non_interactive_delete(
+            true, false, true, true, true
+        ));
+    }
+
+    #[test]
+    fn should_refuse_non_interactive_delete_when_not_a_tty() {
+        assert!(should_refuse_non_interactive_delete(
+            true, false, false, false, true
+        ));
+        assert!(should_refuse_non_interactive_delete(
+            true, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn should_not_refuse_when_yes_is_passed() {
+        assert!(!should_refuse_non_interactive_delete(
+            true, true, true, false, false
+        ));
+    }
+
+    #[test]
+    fn should_not_refuse_when_delete_is_not_passed() {
+        assert!(!should_refuse_non_interactive_delete(
+            false, false, true, false, false
+        ));
     }
 }

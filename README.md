@@ -95,13 +95,13 @@ cargo install --path .
 ## Usage
 
 ```bash
-# Scan current directory (shows table by default)
+# Scan current directory (shows table by default; in a terminal, offers to delete)
 cleanslate
 
 # Scan specific directories
 cleanslate /path/to/dir1 /path/to/dir2
 
-# Preview what would be deleted (dry run)
+# Preview what would be deleted without being prompted
 cleanslate --dry-run
 
 # Show detailed list format instead of table
@@ -124,6 +124,9 @@ cleanslate --delete
 
 # Delete without confirming (skip the interactive prompt)
 cleanslate --delete --yes
+
+# Never prompt; behave as if the session were not interactive
+cleanslate --no-prompt
 ```
 
 ## Options
@@ -133,6 +136,7 @@ cleanslate --delete --yes
 - `-y, --yes`: Skip the interactive confirmation prompt and delete all matched artifacts (requires `--delete`)
 - `-v, --verbose`: Show detailed information about found artifacts
 - `--dry-run`: Preview what would be deleted without deleting; cannot be combined with `--delete`
+- `--no-prompt`: Never prompt; behave as if the session were not interactive
 - `-l, --list`: Show detailed list format instead of table (table is default)
 - `--aggressive`: Include small or trivial files such as `.DS_Store`
 - `-x, --exclude <DIR>`: Exclude directories by name; may be repeated
@@ -165,13 +169,21 @@ An active time filter also adds a **Too Recent** column. Removable totals over 1
 
 If some artifacts were skipped because their version-control status could not be determined, CleanSlate keeps them and reports the count after the report; rerun with `--verbose` to see which paths were affected.
 
+When the output is a terminal, a plain scan ends by offering to delete the same artifacts it just reported. If stdout, stdin, or stderr is redirected (for example, `cleanslate > report.txt`), the scan instead prints the `To delete: cleanslate --delete ...` hint so scripts can capture the report without being interrupted.
+
 ## Interactive Deletion
 
-When `--delete` is used interactively (both stdin and stderr are TTYs), CleanSlate first scans without deleting and then presents a multi-select prompt listing every project, all pre-selected. Each line shows the project's relative path and its removable size (omitted under `--no-sizes`). Press `Space` to toggle selection, `Enter` to confirm, or `Esc` / `Ctrl-C` to cancel.
+When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) and at least one removable artifact is found, CleanSlate displays the report and then offers to delete the artifacts it found. The prompt shows a one-line summary — `Delete N artifact(s) across M project(s), X GiB?` (the size clause is omitted under `--no-sizes`) — and three options, with `No` initially highlighted:
 
-After the multi-select, CleanSlate prints a one-line summary — `Delete N artifact(s) across M project(s), X GiB?` — and requires an explicit confirmation that defaults to "no", so a bare `Enter` declines. Declining, canceling, or selecting no projects prints "No artifacts deleted." and exits with code 0 without deleting anything.
+- **No** — declines deletion. Pressing `Enter`, `Esc`, or `Ctrl-C` also chooses this option. Prints "No artifacts deleted." and exits with code 0 without deleting anything.
+- **Yes, delete all** — deletes every project in the plan, exactly as `--delete --yes` does.
+- **Choose projects…** — opens the per-project multi-select, listing every project with all pre-selected. Press `Space` to toggle selection and `Enter` to confirm; `Esc` / `Ctrl-C` cancels. Whatever remains selected is deleted immediately with no second confirmation. Selecting nothing or canceling prints "No artifacts deleted." and exits with code 0.
 
-When stdin or stderr is not a TTY, `--delete` without `--yes` refuses to run rather than deleting silently. Use `--delete --yes` to skip both prompts and delete everything that matched.
+If stdout, stdin, or stderr is redirected (for example, `cleanslate > report.txt`), a plain scan does not prompt; it prints the `To delete: cleanslate --delete ...` hint instead so the report remains scriptable. Use `--dry-run` to preview the deletion set without being prompted.
+
+When `--delete` is used without `--yes`, CleanSlate still requires an interactive session (both stdin and stderr are TTYs) and refuses to run otherwise, rather than deleting silently. Use `--delete --yes` to skip the prompt and delete everything that matched.
+
+`--no-prompt` makes CleanSlate behave as if the session were not interactive. A plain scan with `--no-prompt` prints the `To delete: cleanslate --delete ...` hint instead of offering to delete, and `--delete --no-prompt` without `--yes` is refused with the same error as a redirected run. `--delete --yes --no-prompt` deletes everything, since `--yes` needs no prompt.
 
 ## License
 
