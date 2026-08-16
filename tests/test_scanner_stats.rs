@@ -57,6 +57,7 @@ fn file_artifacts_use_one_vcs_batch_call_per_project() {
     let options = ScanOptions {
         verbose: false,
         calculate_sizes: false,
+        color: false,
     };
     let result = scan_single_path(
         dir.path().to_str().unwrap(),
@@ -108,6 +109,7 @@ fn file_artifact_time_filter_stats_count_file() {
     let options = ScanOptions {
         verbose: false,
         calculate_sizes: false,
+        color: false,
     };
     let result = scan_single_path(
         dir.path().to_str().unwrap(),
@@ -139,6 +141,7 @@ fn category2_directory_time_filter_stats_count_directory() {
     let options = ScanOptions {
         verbose: false,
         calculate_sizes: false,
+        color: false,
     };
     let result = scan_single_path(
         dir.path().to_str().unwrap(),
@@ -172,6 +175,7 @@ fn category3_directory_time_filter_stats_count_files() {
     let options = ScanOptions {
         verbose: false,
         calculate_sizes: false,
+        color: false,
     };
     let result = scan_single_path(
         dir.path().to_str().unwrap(),

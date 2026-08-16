@@ -1,10 +1,32 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cleanslate::{
     execute_plan, format_age, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
     ExecutionSummary, ProjectReport, ScanOptions, ScanResult, ScanStats, TimeFilter,
 };
 use colored::Colorize;
+
+/// When to use color in output.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum ColorWhen {
+    /// Use color when stdout is a terminal and the environment allows it.
+    #[default]
+    Auto,
+    /// Always use color, even when output is piped or NO_COLOR is set.
+    Always,
+    /// Never use color, even when CLICOLOR_FORCE is set.
+    Never,
+}
+
+impl std::fmt::Display for ColorWhen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ColorWhen::Auto => write!(f, "auto"),
+            ColorWhen::Always => write!(f, "always"),
+            ColorWhen::Never => write!(f, "never"),
+        }
+    }
+}
 use humansize::{format_size, BINARY};
 use inquire::{MultiSelect, Select};
 use rayon::prelude::*;
@@ -72,6 +94,10 @@ struct Args {
     /// Deprecated: sizes are calculated by default; this flag is ignored
     #[arg(long, hide = true)]
     calculate_sizes: bool,
+
+    /// When to use color in output
+    #[arg(long, value_name = "WHEN", default_value_t = ColorWhen::Auto)]
+    color: ColorWhen,
 }
 
 fn remove_overlapping_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -922,6 +948,20 @@ fn run_interactive_deletion(
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    match args.color {
+        ColorWhen::Auto => {}
+        ColorWhen::Always => colored::control::set_override(true),
+        ColorWhen::Never => colored::control::set_override(false),
+    }
+
+    // One decision, made by colored from --color, the environment, and terminal
+    // detection, drives the report, the spinner, and the prompts alike.
+    let color = colored::control::SHOULD_COLORIZE.should_colorize();
+    if !color {
+        // inquire renders with its own palette and does not consult colored.
+        inquire::set_global_render_config(inquire::ui::RenderConfig::empty());
+    }
+
     if args.calculate_sizes {
         eprintln!("cleanslate: --calculate-sizes is now the default; the flag is ignored");
     }
@@ -947,6 +987,7 @@ fn main() -> Result<()> {
     let options = ScanOptions {
         verbose: args.verbose,
         calculate_sizes,
+        color,
     };
     let (mut result, unique_paths) = scan_for_artifacts(
         &args.paths,

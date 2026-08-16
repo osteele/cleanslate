@@ -139,6 +139,7 @@ cleanslate --delete --yes
 - `--older-than <DURATION>`: Select artifacts older than a duration such as `48h`, `15d`, `2w`, or `3m`; plain numbers mean days
 - `--modified-before <DATE>`: Select artifacts modified before a date in `YYYY-MM-DD` format
 - `--no-sizes`: Skip artifact size calculation for a faster scan (sizes are calculated by default)
+- `--color <WHEN>`: When to use color in output; `auto` (default), `always`, or `never`
 - `-h, --help`: Print help
 - `-V, --version`: Print version
 
@@ -158,6 +159,14 @@ By default, CleanSlate displays a table with these columns:
 - **What**: Artifacts that would be removed
 
 An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
+
+Color output is controlled by `--color`:
+
+- `auto` (default) — uses color when stdout is a terminal and the environment allows it. Under `auto`, `NO_COLOR`, `CLICOLOR`, and `CLICOLOR_FORCE` are honored.
+- `always` — forces color on, even when output is piped or redirected, and even if `NO_COLOR` is set.
+- `never` — forces color off, even if `CLICOLOR_FORCE` is set.
+
+An explicit `--color` value overrides the environment variables. The resulting setting applies to the whole interface: the report, the scan progress indicator, and the interactive prompts.
 
 `--no-sizes` skips size calculation for a faster scan; the table then omits the size columns and ends with an artifact count instead of a total size.
 

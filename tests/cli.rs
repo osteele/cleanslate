@@ -781,6 +781,100 @@ fn test_list_report_starts_with_exactly_one_blank_line() {
     );
 }
 
+/// Default color mode (auto) with piped output must not emit ANSI escape sequences.
+#[test]
+fn test_color_auto_piped_no_escapes() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd.arg(dir.path()).arg("--list").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        !stdout.contains("\x1b["),
+        "expected no ANSI escapes in default auto/piped output:\n{}",
+        stdout
+    );
+}
+
+/// --color=always with piped output must emit ANSI escape sequences.
+#[test]
+fn test_color_always_piped_has_escapes() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd
+        .arg(dir.path())
+        .arg("--list")
+        .arg("--color=always")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        stdout.contains("\x1b["),
+        "expected ANSI escapes in --color=always output:\n{}",
+        stdout
+    );
+}
+
+/// An explicit --color=always beats the NO_COLOR environment variable.
+#[test]
+fn test_color_always_overrides_no_color() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd
+        .arg(dir.path())
+        .arg("--list")
+        .arg("--color=always")
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        stdout.contains("\x1b["),
+        "expected ANSI escapes when --color=always overrides NO_COLOR:\n{}",
+        stdout
+    );
+}
+
+/// An explicit --color=never beats the CLICOLOR_FORCE environment variable.
+#[test]
+fn test_color_never_overrides_clicolor_force() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd
+        .arg(dir.path())
+        .arg("--list")
+        .arg("--color=never")
+        .env("CLICOLOR_FORCE", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        !stdout.contains("\x1b["),
+        "expected no ANSI escapes when --color=never overrides CLICOLOR_FORCE:\n{}",
+        stdout
+    );
+}
+
+/// An invalid --color value must produce a usage error and a non-zero exit.
+#[test]
+fn test_color_invalid_value_errors() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--color=sometimes").assert();
+
+    assert
+        .failure()
+        .stderr(predicate::str::contains("error: invalid value"));
+}
+
 /// Regression test: the "No artifacts found." message must be preceded by
 /// exactly one blank line.
 #[test]

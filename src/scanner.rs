@@ -23,6 +23,7 @@ use std::time::SystemTime;
 pub struct ScanOptions {
     pub verbose: bool,
     pub calculate_sizes: bool,
+    pub color: bool,
 }
 
 /// Statistics gathered during a scan
@@ -820,11 +821,12 @@ pub fn scan_single_path(
 
     // Create progress bar
     let progress = Arc::new(ProgressBar::new_spinner());
-    progress.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} [{elapsed_precise}] {msg}")
-            .unwrap(),
-    );
+    let template = if options.color {
+        "{spinner:.green} [{elapsed_precise}] {msg}"
+    } else {
+        "{spinner} [{elapsed_precise}] {msg}"
+    };
+    progress.set_style(ProgressStyle::default_spinner().template(template).unwrap());
     progress.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Create bounded channel for streaming project roots
