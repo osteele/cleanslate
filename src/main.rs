@@ -213,6 +213,7 @@ struct DeleteCommand<'a> {
 
 /// Display scan results in table or list format
 fn display_results(report: &Report, list: bool) {
+    println!();
     if report.projects.is_empty() {
         println!("No artifacts found.");
     } else if !list {
@@ -264,7 +265,7 @@ fn display_table_format(report: &Report) {
 
     // If no projects to display, show a special message
     if sorted_projects.is_empty() {
-        println!("\nNo artifacts found.");
+        println!("No artifacts found.");
         return;
     }
 

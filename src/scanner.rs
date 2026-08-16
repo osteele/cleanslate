@@ -886,7 +886,7 @@ pub fn scan_single_path(
     }
 
     // Finish progress bar
-    progress.finish_with_message("Scan complete!");
+    progress.finish_and_clear();
 
     Ok(ScanResult {
         projects,

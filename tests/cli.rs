@@ -774,3 +774,110 @@ fn test_dry_run_piped_output_prints_dry_run_line_and_no_hint() {
     assert!(dir.path().join("__pycache__").exists());
     assert!(dir.path().join("target").exists());
 }
+
+/// Regression test: the progress spinner's final line must not survive into
+/// the captured report output.
+#[test]
+fn test_scan_stdout_does_not_contain_scan_complete() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(
+        !stdout.contains("Scan complete!"),
+        "stdout contained 'Scan complete!':\n{}",
+        stdout
+    );
+}
+
+/// Regression test: the report must begin with exactly one blank line in
+/// default table mode, so the first line is empty and the second is not.
+#[test]
+fn test_table_report_starts_with_exactly_one_blank_line() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least two lines of stdout:\n{}",
+        stdout
+    );
+    assert!(
+        lines[0].is_empty(),
+        "expected first line to be empty:\n{}",
+        stdout
+    );
+    assert!(
+        !lines[1].is_empty(),
+        "expected second line to be non-empty:\n{}",
+        stdout
+    );
+}
+
+/// Regression test: the report must begin with exactly one blank line in
+/// --list mode.
+#[test]
+fn test_list_report_starts_with_exactly_one_blank_line() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd
+        .arg(dir.path())
+        .arg("--no-prompt")
+        .arg("--list")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least two lines of stdout:\n{}",
+        stdout
+    );
+    assert!(
+        lines[0].is_empty(),
+        "expected first line to be empty:\n{}",
+        stdout
+    );
+    assert!(
+        !lines[1].is_empty(),
+        "expected second line to be non-empty:\n{}",
+        stdout
+    );
+}
+
+/// Regression test: the "No artifacts found." message must be preceded by
+/// exactly one blank line.
+#[test]
+fn test_no_artifacts_found_starts_with_exactly_one_blank_line() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines: Vec<&str> = stdout.lines().collect();
+
+    assert!(
+        lines.len() >= 2,
+        "expected at least two lines of stdout:\n{}",
+        stdout
+    );
+    assert!(
+        lines[0].is_empty(),
+        "expected first line to be empty:\n{}",
+        stdout
+    );
+    assert_eq!(
+        lines[1], "No artifacts found.",
+        "expected second line to be the empty-results message:\n{}",
+        stdout
+    );
+}
