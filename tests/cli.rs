@@ -394,73 +394,6 @@ fn test_delete_non_tty_without_yes_refuses() {
 }
 
 #[test]
-fn test_delete_no_prompt_without_yes_refuses() {
-    let dir = setup_test_directory();
-
-    assert!(dir.path().join("node_modules").exists());
-    assert!(dir.path().join("__pycache__").exists());
-    assert!(dir.path().join("target").exists());
-
-    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd
-        .arg(dir.path())
-        .arg("--delete")
-        .arg("--no-prompt")
-        .assert();
-
-    assert.failure().stderr(predicate::str::contains(
-        "refusing to delete without a confirmation prompt",
-    ));
-
-    assert!(dir.path().join("node_modules").exists());
-    assert!(dir.path().join("__pycache__").exists());
-    assert!(dir.path().join("target").exists());
-}
-
-#[test]
-fn test_delete_yes_no_prompt_still_deletes() {
-    let dir = setup_test_directory();
-
-    assert!(dir.path().join("node_modules").exists());
-    assert!(dir.path().join("__pycache__").exists());
-    assert!(dir.path().join("target").exists());
-
-    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd
-        .arg(dir.path())
-        .arg("--delete")
-        .arg("--yes")
-        .arg("--no-prompt")
-        .assert();
-
-    assert
-        .success()
-        .stdout(predicate::str::contains("Removed"))
-        .stdout(predicate::str::contains("artifact(s) across"));
-
-    assert!(!dir.path().join("node_modules").exists());
-    assert!(!dir.path().join("__pycache__").exists());
-    assert!(!dir.path().join("target").exists());
-}
-
-#[test]
-fn test_plain_scan_no_prompt_prints_delete_hint_and_deletes_nothing() {
-    let dir = setup_test_directory();
-
-    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let assert = cmd.arg(dir.path()).arg("--no-prompt").assert();
-
-    assert
-        .success()
-        .stdout(predicate::str::contains("To delete: cleanslate --delete"))
-        .stdout(predicate::str::contains("No artifacts deleted.").not());
-
-    assert!(dir.path().join("node_modules").exists());
-    assert!(dir.path().join("__pycache__").exists());
-    assert!(dir.path().join("target").exists());
-}
-
-#[test]
 fn test_yes_without_delete_errors() {
     let dir = setup_test_directory();
 
@@ -782,7 +715,7 @@ fn test_scan_stdout_does_not_contain_scan_complete() {
     let dir = setup_test_directory();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let output = cmd.arg(dir.path()).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
 
     assert!(
@@ -799,7 +732,7 @@ fn test_table_report_starts_with_exactly_one_blank_line() {
     let dir = setup_test_directory();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let output = cmd.arg(dir.path()).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 
@@ -827,12 +760,7 @@ fn test_list_report_starts_with_exactly_one_blank_line() {
     let dir = setup_test_directory();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let output = cmd
-        .arg(dir.path())
-        .arg("--no-prompt")
-        .arg("--list")
-        .output()
-        .unwrap();
+    let output = cmd.arg(dir.path()).arg("--list").output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 
@@ -861,7 +789,7 @@ fn test_no_artifacts_found_starts_with_exactly_one_blank_line() {
     fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
 
     let mut cmd = Command::cargo_bin("cleanslate").unwrap();
-    let output = cmd.arg(dir.path()).arg("--no-prompt").output().unwrap();
+    let output = cmd.arg(dir.path()).output().unwrap();
     let stdout = String::from_utf8(output.stdout).unwrap();
     let lines: Vec<&str> = stdout.lines().collect();
 

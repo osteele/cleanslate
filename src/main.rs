@@ -35,10 +35,6 @@ struct Args {
     #[arg(long, short, requires = "delete")]
     yes: bool,
 
-    /// Never prompt; behave as if the session were not interactive
-    #[arg(long)]
-    no_prompt: bool,
-
     /// Show detailed information about found artifacts
     #[arg(long, short)]
     verbose: bool,
@@ -685,25 +681,23 @@ fn has_removable_artifacts(projects: &HashMap<PathBuf, ProjectReport>) -> bool {
 fn should_offer_deletion(
     delete: bool,
     dry_run: bool,
-    no_prompt: bool,
     stdout_tty: bool,
     stdin_tty: bool,
     stderr_tty: bool,
     has_removable: bool,
 ) -> bool {
-    !delete && !dry_run && !no_prompt && stdout_tty && stdin_tty && stderr_tty && has_removable
+    !delete && !dry_run && stdout_tty && stdin_tty && stderr_tty && has_removable
 }
 
 /// Decide whether a `--delete` run without `--yes` must be refused because there
-/// is no terminal to prompt on or `--no-prompt` was requested.
+/// is no terminal to prompt on.
 fn should_refuse_non_interactive_delete(
     delete: bool,
     yes: bool,
-    no_prompt: bool,
     stdin_tty: bool,
     stderr_tty: bool,
 ) -> bool {
-    delete && !yes && (no_prompt || !stdin_tty || !stderr_tty)
+    delete && !yes && (!stdin_tty || !stderr_tty)
 }
 
 /// Prompt the user to select which projects to clean. Returns None if the prompt is canceled.
@@ -936,11 +930,10 @@ fn main() -> Result<()> {
     let now = SystemTime::now();
 
     // Deletion without --yes requires an interactive confirmation prompt; refuse when
-    // there is no terminal to prompt on or when --no-prompt was requested.
+    // there is no terminal to prompt on.
     if should_refuse_non_interactive_delete(
         args.delete,
         args.yes,
-        args.no_prompt,
         std::io::stdin().is_terminal(),
         std::io::stderr().is_terminal(),
     ) {
@@ -989,7 +982,6 @@ fn main() -> Result<()> {
         } else if should_offer_deletion(
             args.delete,
             args.dry_run,
-            args.no_prompt,
             std::io::stdout().is_terminal(),
             std::io::stdin().is_terminal(),
             std::io::stderr().is_terminal(),
@@ -1086,80 +1078,60 @@ mod tests {
 
     #[test]
     fn should_offer_deletion_when_all_conditions_hold() {
-        assert!(should_offer_deletion(
-            false, false, false, true, true, true, true
-        ));
+        assert!(should_offer_deletion(false, false, true, true, true, true));
     }
 
     #[test]
     fn should_not_offer_deletion_when_delete_is_passed() {
-        assert!(!should_offer_deletion(
-            true, false, false, true, true, true, true
-        ));
+        assert!(!should_offer_deletion(true, false, true, true, true, true));
     }
 
     #[test]
     fn should_not_offer_deletion_when_dry_run_is_passed() {
-        assert!(!should_offer_deletion(
-            false, true, false, true, true, true, true
-        ));
-    }
-
-    #[test]
-    fn should_not_offer_deletion_when_no_prompt_is_passed() {
-        assert!(!should_offer_deletion(
-            false, false, true, true, true, true, true
-        ));
+        assert!(!should_offer_deletion(false, true, true, true, true, true));
     }
 
     #[test]
     fn should_not_offer_deletion_when_any_stream_is_not_a_tty() {
         assert!(!should_offer_deletion(
-            false, false, false, false, true, true, true
+            false, false, false, true, true, true
         ));
         assert!(!should_offer_deletion(
-            false, false, false, true, false, true, true
+            false, false, true, false, true, true
         ));
         assert!(!should_offer_deletion(
-            false, false, false, true, true, false, true
+            false, false, true, true, false, true
         ));
     }
 
     #[test]
     fn should_not_offer_deletion_when_nothing_is_removable() {
         assert!(!should_offer_deletion(
-            false, false, false, true, true, true, false
-        ));
-    }
-
-    #[test]
-    fn should_refuse_non_interactive_delete_when_no_prompt() {
-        assert!(should_refuse_non_interactive_delete(
-            true, false, true, true, true
+            false, false, true, true, true, false
         ));
     }
 
     #[test]
     fn should_refuse_non_interactive_delete_when_not_a_tty() {
         assert!(should_refuse_non_interactive_delete(
-            true, false, false, false, true
+            true, false, false, true
         ));
         assert!(should_refuse_non_interactive_delete(
-            true, false, false, true, false
+            true, false, true, false
         ));
     }
 
     #[test]
     fn should_not_refuse_when_yes_is_passed() {
         assert!(!should_refuse_non_interactive_delete(
-            true, true, true, false, false
+            true, true, false, false
         ));
     }
 
     #[test]
     fn should_not_refuse_when_delete_is_not_passed() {
         assert!(!should_refuse_non_interactive_delete(
-            false, false, true, false, false
+            false, false, false, false
         ));
     }
 }

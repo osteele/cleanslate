@@ -124,9 +124,6 @@ cleanslate --delete
 
 # Delete without confirming (skip the interactive prompt)
 cleanslate --delete --yes
-
-# Never prompt; behave as if the session were not interactive
-cleanslate --no-prompt
 ```
 
 ## Options
@@ -136,7 +133,6 @@ cleanslate --no-prompt
 - `-y, --yes`: Skip the interactive confirmation prompt and delete all matched artifacts (requires `--delete`)
 - `-v, --verbose`: Show detailed information about found artifacts
 - `--dry-run`: Preview what would be deleted without deleting; cannot be combined with `--delete`
-- `--no-prompt`: Never prompt; behave as if the session were not interactive
 - `-l, --list`: Show detailed list format instead of table (table is default)
 - `--aggressive`: Include small or trivial files such as `.DS_Store`
 - `-x, --exclude <DIR>`: Exclude directories by name; may be repeated
@@ -182,8 +178,6 @@ When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) 
 If stdout, stdin, or stderr is redirected (for example, `cleanslate > report.txt`), a plain scan does not prompt; it prints the `To delete: cleanslate --delete ...` hint instead so the report remains scriptable. Use `--dry-run` to preview the deletion set without being prompted.
 
 When `--delete` is used without `--yes`, CleanSlate still requires an interactive session (both stdin and stderr are TTYs) and refuses to run otherwise, rather than deleting silently. Use `--delete --yes` to skip the prompt and delete everything that matched.
-
-`--no-prompt` makes CleanSlate behave as if the session were not interactive. A plain scan with `--no-prompt` prints the `To delete: cleanslate --delete ...` hint instead of offering to delete, and `--delete --no-prompt` without `--yes` is refused with the same error as a redirected run. `--delete --yes --no-prompt` deletes everything, since `--yes` needs no prompt.
 
 ## License
 
