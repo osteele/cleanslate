@@ -22,8 +22,8 @@ pub use patterns::{
     get_artifact_patterns, is_artifact, is_recreatable_dir, ArtifactPattern, ArtifactType,
 };
 pub use scanner::{
-    find_project_root, scan_single_path, truncate_name_with_suffix, ArtifactEntry, ProjectReport,
-    ScanOptions, ScanResult,
+    delete_selected_artifacts, find_project_root, scan_single_path, truncate_name_with_suffix,
+    ArtifactEntry, ProjectReport, ScanOptions, ScanResult,
 };
 pub use time::{TimeFilter, TimeFilterContext, TimeFilterStats};
 pub use vcs::{detect_vcs, VcsCheckResult, VcsType};

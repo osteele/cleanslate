@@ -1,15 +1,17 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use cleanslate::{
-    get_artifact_patterns, scan_single_path, truncate_name_with_suffix, ArtifactPattern,
-    ProjectReport, ScanOptions, ScanResult, TimeFilter, TimeFilterStats,
+    delete_selected_artifacts, get_artifact_patterns, scan_single_path, truncate_name_with_suffix,
+    ArtifactPattern, ProjectReport, ScanOptions, ScanResult, TimeFilter, TimeFilterStats,
 };
 use colored::Colorize;
 use humansize::{format_size, BINARY};
+use inquire::MultiSelect;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    io::IsTerminal,
     path::PathBuf,
 };
 
@@ -28,6 +30,10 @@ struct Args {
     /// Delete the found artifacts
     #[arg(long, short)]
     delete: bool,
+
+    /// Skip the interactive confirmation prompt and delete all matched artifacts
+    #[arg(long, short, requires = "delete")]
+    yes: bool,
 
     /// Show detailed information about found artifacts
     #[arg(long, short)]
@@ -85,7 +91,7 @@ fn scan_for_artifacts(
     exclude: Vec<String>,
     older_than: Option<String>,
     modified_before: Option<String>,
-) -> Result<()> {
+) -> Result<(ScanResult, Vec<PathBuf>, Vec<ArtifactPattern>)> {
     // Load patterns once (shared across all parallel scans)
     let patterns = get_artifact_patterns(aggressive).context("Failed to load artifact patterns")?;
 
@@ -144,28 +150,15 @@ fn scan_for_artifacts(
         }
     }
 
-    // Cleanup pass: Remove empty directories
-    if options.delete && !options.dry_run {
-        cleanup_empty_directories(&projects, options);
-    }
-
-    // Display results
-    display_results(
-        &projects,
-        &unique_paths,
-        &patterns,
-        &time_filter,
-        options,
-        total_bytes,
-        &combined_stats,
-        paths,
-        &older_than,
-        &modified_before,
-        aggressive,
-        &exclude,
-    );
-
-    Ok(())
+    Ok((
+        ScanResult {
+            projects,
+            total_bytes,
+            stats: combined_stats,
+        },
+        unique_paths,
+        patterns,
+    ))
 }
 
 /// Remove empty directories after artifact deletion
@@ -793,14 +786,181 @@ fn main() -> Result<()> {
         calculate_sizes: args.calculate_sizes,
     };
 
-    scan_for_artifacts(
+    let is_interactive = args.delete
+        && !args.dry_run
+        && !args.yes
+        && std::io::stdin().is_terminal()
+        && std::io::stderr().is_terminal();
+
+    if is_interactive {
+        run_interactive_deletion(&args, options)?;
+    } else {
+        run_direct_deletion(&args, options)?;
+    }
+
+    Ok(())
+}
+
+fn run_direct_deletion(args: &Args, options: ScanOptions) -> Result<()> {
+    let (result, unique_paths, patterns) = scan_for_artifacts(
         &args.paths,
         options,
         args.aggressive,
-        args.exclude,
-        args.older_than,
-        args.modified_before,
+        args.exclude.clone(),
+        args.older_than.clone(),
+        args.modified_before.clone(),
     )?;
+
+    if options.delete && !options.dry_run {
+        cleanup_empty_directories(&result.projects, options);
+    }
+
+    let time_filter =
+        TimeFilter::from_args(args.older_than.as_deref(), args.modified_before.as_deref())?;
+    display_results(
+        &result.projects,
+        &unique_paths,
+        &patterns,
+        &time_filter,
+        options,
+        result.total_bytes,
+        &result.stats,
+        &args.paths,
+        &args.older_than,
+        &args.modified_before,
+        args.aggressive,
+        &args.exclude,
+    );
+
+    Ok(())
+}
+
+fn run_interactive_deletion(args: &Args, options: ScanOptions) -> Result<()> {
+    // Scan first without deleting to collect the artifact report.
+    let scan_options = ScanOptions {
+        delete: false,
+        dry_run: false,
+        ..options
+    };
+    let (mut result, unique_paths, patterns) = scan_for_artifacts(
+        &args.paths,
+        scan_options,
+        args.aggressive,
+        args.exclude.clone(),
+        args.older_than.clone(),
+        args.modified_before.clone(),
+    )?;
+
+    let time_filter =
+        TimeFilter::from_args(args.older_than.as_deref(), args.modified_before.as_deref())?;
+
+    if result.projects.is_empty() {
+        display_results(
+            &result.projects,
+            &unique_paths,
+            &patterns,
+            &time_filter,
+            scan_options,
+            result.total_bytes,
+            &result.stats,
+            &args.paths,
+            &args.older_than,
+            &args.modified_before,
+            args.aggressive,
+            &args.exclude,
+        );
+        return Ok(());
+    }
+
+    // Build the list of projects shown in the multi-select prompt.
+    let start_path = if unique_paths.len() == 1 {
+        unique_paths[0].clone()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    };
+
+    let mut project_items: Vec<(PathBuf, String)> = result
+        .projects
+        .iter()
+        .filter(|(_, report)| !report.artifacts.is_empty())
+        .map(|(path, report)| {
+            let removable_size: u64 = report
+                .artifacts
+                .iter()
+                .filter(|a| !a.time_filtered)
+                .map(|a| a.size)
+                .sum();
+            let relative = path
+                .strip_prefix(&start_path)
+                .unwrap_or(path)
+                .display()
+                .to_string();
+            let display = if relative.is_empty() {
+                ".".to_string()
+            } else {
+                relative
+            };
+            let label = if options.calculate_sizes {
+                format!("{} ({})", display, format_size(removable_size, BINARY))
+            } else {
+                display
+            };
+            (path.clone(), label)
+        })
+        .collect();
+    project_items.sort_by(|a, b| a.1.cmp(&b.1));
+
+    let prompt_options: Vec<String> = project_items
+        .iter()
+        .map(|(_, label)| label.clone())
+        .collect();
+    let defaults: Vec<usize> = (0..prompt_options.len()).collect();
+
+    let selected_labels = match MultiSelect::new("Select projects to clean:", prompt_options)
+        .with_default(&defaults)
+        .prompt()
+    {
+        Ok(selection) => selection,
+        Err(inquire::InquireError::OperationCanceled)
+        | Err(inquire::InquireError::OperationInterrupted) => {
+            println!("No artifacts deleted.");
+            return Ok(());
+        }
+        Err(err) => return Err(err.into()),
+    };
+
+    let selected_paths: HashSet<PathBuf> = selected_labels
+        .iter()
+        .filter_map(|label| {
+            project_items
+                .iter()
+                .find(|(_, l)| *l == **label)
+                .map(|(path, _)| path.clone())
+        })
+        .collect();
+
+    delete_selected_artifacts(&mut result.projects, &selected_paths, options.verbose);
+    cleanup_empty_directories(&result.projects, options);
+
+    let display_options = ScanOptions {
+        delete: true,
+        dry_run: false,
+        ..options
+    };
+    display_results(
+        &result.projects,
+        &unique_paths,
+        &patterns,
+        &time_filter,
+        display_options,
+        result.total_bytes,
+        &result.stats,
+        &args.paths,
+        &args.older_than,
+        &args.modified_before,
+        args.aggressive,
+        &args.exclude,
+    );
 
     Ok(())
 }

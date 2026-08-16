@@ -120,12 +120,16 @@ cleanslate --older-than 2w
 
 # Delete artifacts
 cleanslate --delete
+
+# Delete without confirming (skip the interactive prompt)
+cleanslate --delete --yes
 ```
 
 ## Options
 
 - `[PATHS]...`: Directories to scan (defaults to current directory)
 - `-d, --delete`: Delete the found artifacts
+- `-y, --yes`: Skip the interactive confirmation prompt and delete all matched artifacts (requires `--delete`)
 - `-v, --verbose`: Show detailed information about found artifacts
 - `--dry-run`: Show what would be deleted without actually deleting (implies --delete)
 - `-l, --list`: Show detailed list format instead of table (table is default)
@@ -153,6 +157,12 @@ By default, CleanSlate displays a table with these columns:
 `--calculate-sizes` adds a **Removable** column. An active time filter also adds a **Too Recent** column. Removable totals over 100 MiB are highlighted, and individual artifacts over 50 MiB are shown in bold.
 
 `--list` displays a per-project breakdown grouped by language or tool.
+
+## Interactive Deletion
+
+When `--delete` is used interactively (both stdin and stderr are TTYs), CleanSlate first scans without deleting and then presents a multi-select prompt listing every project, all pre-selected. Each line shows the project's relative path and, if `--calculate-sizes` was given, its removable size. Press `Space` to toggle selection, `Enter` to confirm, or `Esc` / `Ctrl-C` to cancel. Canceling prints "No artifacts deleted." and exits with code 0.
+
+When stdin or stderr is not a TTY, `--delete` deletes everything immediately, exactly as before. Use `--delete --yes` to skip the prompt even in a TTY.
 
 ## License
 

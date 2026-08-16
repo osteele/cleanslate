@@ -329,3 +329,115 @@ fn test_list_mode_without_calculate_sizes() {
         .stdout(predicate::str::contains("__pycache__"))
         .stdout(predicate::str::contains("target"));
 }
+
+#[test]
+fn test_delete_yes_flag_deletes_without_prompt() {
+    let dir = setup_test_directory();
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+    assert!(dir.path().join("target").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--delete").arg("--yes").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Total Size Removed"));
+
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(!dir.path().join("__pycache__").exists());
+    assert!(!dir.path().join("target").exists());
+}
+
+#[test]
+fn test_delete_with_non_tty_stdin_deletes_everything() {
+    let dir = setup_test_directory();
+
+    assert!(dir.path().join("node_modules").exists());
+    assert!(dir.path().join("__pycache__").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    cmd.arg(dir.path()).arg("--delete");
+    // Pipe empty stdin so stdin is not a TTY; deletion should proceed without prompting.
+    let assert = cmd.write_stdin("").assert();
+
+    assert
+        .success()
+        .stdout(predicate::str::contains("Total Size Removed"));
+
+    assert!(!dir.path().join("node_modules").exists());
+    assert!(!dir.path().join("__pycache__").exists());
+}
+
+#[test]
+fn test_yes_without_delete_errors() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--yes").assert();
+
+    assert.failure();
+}
+
+#[test]
+fn test_selective_deletion_pass_only_removes_selected_projects() {
+    use cleanslate::{delete_selected_artifacts, ArtifactEntry, ProjectReport, ScanResult};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    let project_a = dir.path().join("project_a");
+    let project_b = dir.path().join("project_b");
+    fs::create_dir_all(&project_a).unwrap();
+    fs::create_dir_all(&project_b).unwrap();
+
+    let file_a = project_a.join("stale.log");
+    let file_b = project_b.join("stale.log");
+    fs::write(&file_a, "a").unwrap();
+    fs::write(&file_b, "b").unwrap();
+
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_a.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: file_a.clone(),
+                size: 1,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                files: Vec::new(),
+            }],
+        },
+    );
+    projects.insert(
+        project_b.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: file_b.clone(),
+                size: 1,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let mut result = ScanResult {
+        projects,
+        total_bytes: 2,
+        stats: cleanslate::TimeFilterStats::default(),
+    };
+
+    let selected: HashSet<std::path::PathBuf> = [project_a.clone()].into_iter().collect();
+    delete_selected_artifacts(&mut result.projects, &selected, false);
+
+    assert!(file_a.metadata().is_err());
+    assert!(file_b.exists());
+
+    let a_removed = result.projects[&project_a].artifacts[0].removed;
+    let b_removed = result.projects[&project_b].artifacts[0].removed;
+    assert!(a_removed);
+    assert!(!b_removed);
+}

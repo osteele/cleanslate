@@ -38,6 +38,8 @@ pub struct ArtifactEntry {
     #[allow(dead_code)]
     pub modified: Option<SystemTime>,
     pub time_filtered: bool,
+    /// Files to remove for Category 3 (mixed) directories; empty for Category 2 dirs and files.
+    pub files: Vec<PathBuf>,
 }
 
 /// Report of artifacts found in a project
@@ -159,6 +161,77 @@ fn remove_recreatable_dir(path: &Path) -> io::Result<()> {
             fs::remove_dir_all(path)
         }
         result => result,
+    }
+}
+
+/// Remove a single file artifact, logging per-file errors.
+pub fn remove_file_artifact(path: &Path, verbose: bool) -> bool {
+    match fs::remove_file(path) {
+        Ok(_) => {
+            if verbose {
+                println!("Removed: {}", path.display());
+            }
+            true
+        }
+        Err(err) => {
+            eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
+            false
+        }
+    }
+}
+
+/// Remove a recreatable (Category 2) directory artifact.
+pub fn remove_recreatable_artifact(path: &Path, verbose: bool) -> bool {
+    match remove_recreatable_dir(path) {
+        Ok(_) => {
+            if verbose {
+                println!("Removed directory: {}", path.display());
+            }
+            true
+        }
+        Err(err) => {
+            eprintln!("Error removing {}: {}", path.display(), err);
+            false
+        }
+    }
+}
+
+/// Remove a Category 3 (mixed) directory artifact by removing its untracked files.
+pub fn remove_category3_artifact(files: &[PathBuf], verbose: bool) -> bool {
+    let mut removed = false;
+    for file_path in files {
+        if remove_file_artifact(file_path, verbose) {
+            removed = true;
+        }
+    }
+    removed
+}
+
+/// Delete artifacts belonging to the selected projects.
+/// Updates `entry.removed` for each artifact actually removed.
+pub fn delete_selected_artifacts(
+    projects: &mut HashMap<PathBuf, ProjectReport>,
+    selected_projects: &HashSet<PathBuf>,
+    verbose: bool,
+) {
+    for (project_path, project_report) in projects.iter_mut() {
+        if !selected_projects.contains(project_path) {
+            continue;
+        }
+        for entry in &mut project_report.artifacts {
+            if entry.time_filtered {
+                continue;
+            }
+            entry.removed = if entry.path.is_dir() {
+                if entry.files.is_empty() {
+                    remove_recreatable_artifact(&entry.path, verbose)
+                } else {
+                    remove_category3_artifact(&entry.files, verbose)
+                }
+            } else {
+                remove_file_artifact(&entry.path, verbose)
+            };
+        }
     }
 }
 
@@ -340,18 +413,7 @@ fn handle_directory_artifact(
         // Remove entire directory if in delete mode AND passes time filter
         let should_remove = passes_time_filter && (options.delete || options.dry_run);
         let removed = if should_remove && options.delete && !options.dry_run {
-            match remove_recreatable_dir(path) {
-                Ok(_) => {
-                    if options.verbose {
-                        println!("Removed directory: {}", path.display());
-                    }
-                    true
-                }
-                Err(err) => {
-                    eprintln!("Error removing {}: {}", path.display(), err);
-                    false
-                }
-            }
+            remove_recreatable_artifact(path, options.verbose)
         } else if should_remove && options.dry_run && options.list {
             println!("Would remove directory: {}", path.display());
             false
@@ -369,6 +431,7 @@ fn handle_directory_artifact(
             removed,
             modified: dir_modified,
             time_filtered: !passes_time_filter,
+            files: Vec::new(),
         });
 
         skip_paths.lock().unwrap().insert(path.to_path_buf());
@@ -464,26 +527,19 @@ fn handle_directory_artifact(
 
         // Remove files if in delete mode (files already passed time filter check)
         let should_remove = options.delete || options.dry_run;
-        let mut removed = false;
-        if should_remove && options.delete && !options.dry_run {
-            for (file_path, _) in &files_to_remove {
-                match fs::remove_file(file_path) {
-                    Ok(_) => {
-                        removed = true;
-                        if options.verbose {
-                            println!("Removed: {}", file_path.display());
-                        }
-                    }
-                    Err(err) => eprintln!("Error removing {}: {}", file_path.display(), err),
-                }
-            }
+        let file_paths: Vec<PathBuf> = files_to_remove.iter().map(|(p, _)| p.clone()).collect();
+        let removed = if should_remove && options.delete && !options.dry_run {
+            remove_category3_artifact(&file_paths, options.verbose)
         } else if should_remove && options.dry_run && options.list {
             println!(
                 "Would remove: {} ({} untracked files)",
                 path.display(),
                 files_to_remove.len()
             );
-        }
+            false
+        } else {
+            false
+        };
 
         let dir_modified = fs::symlink_metadata(path)
             .ok()
@@ -496,6 +552,7 @@ fn handle_directory_artifact(
             removed,
             modified: dir_modified,
             time_filtered: false, // Files already passed time filter check
+            files: file_paths,
         });
     }
 
@@ -577,27 +634,11 @@ fn handle_file_artifact(
 
     // Only remove if passes time filter
     let should_remove = passes_time_filter && (options.delete || options.dry_run);
-    let removed = if should_remove {
-        if options.dry_run {
-            if options.list {
-                println!("Would remove: {}", path.display());
-            }
-            false // Not actually removed in dry run
-        } else {
-            // We only remove files now, directories are handled in cleanup pass
-            match fs::remove_file(path) {
-                Ok(_) => {
-                    if options.verbose {
-                        println!("Removed: {}", path.display());
-                    }
-                    true
-                }
-                Err(err) => {
-                    eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
-                    false
-                }
-            }
-        }
+    let removed = if should_remove && !options.dry_run {
+        remove_file_artifact(path, options.verbose)
+    } else if should_remove && options.dry_run && options.list {
+        println!("Would remove: {}", path.display());
+        false
     } else {
         false // Not removed if doesn't pass time filter or neither delete nor dry_run
     };
@@ -608,6 +649,7 @@ fn handle_file_artifact(
         removed,
         modified: modified_time,
         time_filtered: !passes_time_filter,
+        files: Vec::new(),
     });
 
     // Only count towards total if it passes time filter
