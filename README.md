@@ -188,11 +188,19 @@ When the output is a terminal, a plain scan ends by offering to delete the same 
 
 ## Interactive Deletion
 
-When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) and at least one removable artifact is found, CleanSlate displays the report and then offers to delete the artifacts it found. The prompt shows a one-line summary — `Delete N artifact(s) across M project(s), X GiB?` (the size clause is omitted under `--no-sizes`) — and three options, with `No` initially highlighted:
+When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) and at least one removable artifact is found, CleanSlate displays the report and then offers to delete the artifacts it found:
 
-- **No** — declines deletion. Pressing `Enter`, `Esc`, or `Ctrl-C` also chooses this option. Prints "No artifacts deleted." and exits with code 0 without deleting anything.
-- **Yes, delete all** — deletes every project in the plan, exactly as `--delete --yes` does.
-- **Choose projects…** — opens the per-project multi-select, listing every project with all pre-selected. Press `Space` to toggle selection and `Enter` to confirm; `Esc` / `Ctrl-C` cancels. Whatever remains selected is deleted immediately with no second confirmation. Selecting nothing or canceling prints "No artifacts deleted." and exits with code 0.
+```
+Delete 12 artifact(s) across 3 project(s), 4.2 GiB — yes/no/choose/quit [y/N/c/q]?
+```
+
+The size clause is omitted under `--no-sizes`. A single keypress answers it; no `Enter` is needed. The capital `N` marks the default.
+
+- `y` — deletes every project in the plan, exactly as `--delete --yes` does.
+- `n`, `q`, `Enter`, `Esc`, or `Ctrl-C` — declines. Prints "No artifacts deleted." and exits with code 0 without deleting anything.
+- `c` — opens the per-project multi-select, listing every project with all pre-selected. Press `Space` to toggle selection and `Enter` to confirm; `Esc` / `Ctrl-C` cancels. Whatever remains selected is deleted immediately with no second confirmation. Selecting nothing or canceling prints "No artifacts deleted." and exits with code 0.
+
+Any other key is ignored and the prompt keeps waiting.
 
 If stdout, stdin, or stderr is redirected (for example, `cleanslate > report.txt`), a plain scan does not prompt; it prints the `To delete: cleanslate --delete ...` hint instead so the report remains scriptable. Use `--dry-run` to preview the deletion set without being prompted.
 

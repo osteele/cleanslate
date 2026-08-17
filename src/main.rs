@@ -27,8 +27,9 @@ impl std::fmt::Display for ColorWhen {
         }
     }
 }
+use console::{Key, Term};
 use humansize::{format_size, BINARY};
-use inquire::{MultiSelect, Select};
+use inquire::MultiSelect;
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -809,13 +810,13 @@ fn confirmation_prompt(
 ) -> String {
     match total_bytes {
         Some(bytes) => format!(
-            "Delete {} artifact(s) across {} project(s), {}?",
+            "Delete {} artifact(s) across {} project(s), {}",
             artifact_count,
             project_count,
             format_size(bytes, BINARY)
         ),
         None => format!(
-            "Delete {} artifact(s) across {} project(s)?",
+            "Delete {} artifact(s) across {} project(s)",
             artifact_count, project_count
         ),
     }
@@ -855,6 +856,7 @@ fn print_execution_summary(
 }
 
 /// The three-way choice presented in the single interactive deletion prompt.
+#[derive(Debug, PartialEq, Eq)]
 enum InitialDeletionChoice {
     No,
     YesDeleteAll,
@@ -869,6 +871,55 @@ impl std::fmt::Display for InitialDeletionChoice {
             InitialDeletionChoice::ChooseProjects => write!(f, "Choose projects…"),
         }
     }
+}
+
+/// Map a keypress to a deletion choice. `None` means the key is not bound and
+/// the prompt should keep waiting.
+fn key_action(key: &Key) -> Option<InitialDeletionChoice> {
+    match key {
+        Key::Char('y') | Key::Char('Y') => Some(InitialDeletionChoice::YesDeleteAll),
+        Key::Char('n') | Key::Char('N') | Key::Char('q') | Key::Char('Q') => {
+            Some(InitialDeletionChoice::No)
+        }
+        Key::Char('c') | Key::Char('C') => Some(InitialDeletionChoice::ChooseProjects),
+        Key::Enter | Key::Escape | Key::CtrlC => Some(InitialDeletionChoice::No),
+        _ => None,
+    }
+}
+
+/// Ask which projects to clean, accepting a single keypress. Declining is the
+/// default, so it is also what an interrupted or unreadable terminal yields.
+fn prompt_initial_choice(prompt: &str) -> InitialDeletionChoice {
+    let term = Term::stderr();
+    // Without a terminal, read_key yields Key::Unknown forever rather than
+    // blocking, so asking would spin instead of waiting for an answer.
+    if !term.is_term() {
+        return InitialDeletionChoice::No;
+    }
+
+    let line = format!("{} — yes/no/choose/quit [y/N/c/q]? ", prompt);
+    if term.write_str(&line).is_err() {
+        return InitialDeletionChoice::No;
+    }
+
+    let choice = loop {
+        // read_key_raw reports Ctrl-C as a key instead of raising SIGINT, which
+        // lets an interrupted prompt decline and exit cleanly.
+        match term.read_key_raw() {
+            Ok(key) => {
+                if let Some(choice) = key_action(&key) {
+                    break choice;
+                }
+            }
+            // A terminal we cannot read from cannot grant consent to delete.
+            Err(_) => break InitialDeletionChoice::No,
+        }
+    };
+
+    if term.write_line("").is_err() {
+        return InitialDeletionChoice::No;
+    }
+    choice
 }
 
 /// Outcome of the interactive deletion flow shared by `--delete` and a plain
@@ -910,20 +961,7 @@ fn run_interactive_deletion(
             None
         };
         let prompt = confirmation_prompt(artifact_count, projects.len(), total_bytes);
-        let options = vec![
-            InitialDeletionChoice::No,
-            InitialDeletionChoice::YesDeleteAll,
-            InitialDeletionChoice::ChooseProjects,
-        ];
-        let choice = match Select::new(&prompt, options).prompt() {
-            Ok(choice) => choice,
-            Err(inquire::InquireError::OperationCanceled)
-            | Err(inquire::InquireError::OperationInterrupted) => {
-                return Ok(DeletionFlowOutcome::Cancelled);
-            }
-            Err(err) => return Err(err.into()),
-        };
-        match choice {
+        match prompt_initial_choice(&prompt) {
             InitialDeletionChoice::No => return Ok(DeletionFlowOutcome::Cancelled),
             InitialDeletionChoice::YesDeleteAll => projects.keys().cloned().collect(),
             InitialDeletionChoice::ChooseProjects => {
@@ -1085,21 +1123,78 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirmation_prompt, remove_overlapping_paths, should_offer_deletion,
-        should_refuse_non_interactive_delete,
+        confirmation_prompt, key_action, remove_overlapping_paths, should_offer_deletion,
+        should_refuse_non_interactive_delete, InitialDeletionChoice, Key,
     };
     use std::path::PathBuf;
 
     #[test]
+    fn yes_keys_delete_everything() {
+        for key in [Key::Char('y'), Key::Char('Y')] {
+            assert_eq!(
+                key_action(&key),
+                Some(InitialDeletionChoice::YesDeleteAll),
+                "{:?} should delete all",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn declining_keys_include_the_accidental_ones() {
+        for key in [
+            Key::Char('n'),
+            Key::Char('N'),
+            Key::Char('q'),
+            Key::Char('Q'),
+            Key::Enter,
+            Key::Escape,
+            Key::CtrlC,
+        ] {
+            assert_eq!(
+                key_action(&key),
+                Some(InitialDeletionChoice::No),
+                "{:?} should decline",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn choose_keys_open_the_selector() {
+        for key in [Key::Char('c'), Key::Char('C')] {
+            assert_eq!(
+                key_action(&key),
+                Some(InitialDeletionChoice::ChooseProjects),
+                "{:?} should open the selector",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn unbound_keys_leave_the_prompt_waiting() {
+        for key in [
+            Key::Char('x'),
+            Key::Char(' '),
+            Key::ArrowDown,
+            Key::Tab,
+            Key::Backspace,
+        ] {
+            assert_eq!(key_action(&key), None, "{:?} should be ignored", key);
+        }
+    }
+
+    #[test]
     fn confirmation_prompt_includes_size_when_calculated() {
         let prompt = confirmation_prompt(3, 1, Some(2 * 1024 * 1024 * 1024));
-        assert_eq!(prompt, "Delete 3 artifact(s) across 1 project(s), 2 GiB?");
+        assert_eq!(prompt, "Delete 3 artifact(s) across 1 project(s), 2 GiB");
     }
 
     #[test]
     fn confirmation_prompt_omits_size_without_calculated_sizes() {
         let prompt = confirmation_prompt(3, 2, None);
-        assert_eq!(prompt, "Delete 3 artifact(s) across 2 project(s)?");
+        assert_eq!(prompt, "Delete 3 artifact(s) across 2 project(s)");
     }
 
     #[test]
