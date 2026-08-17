@@ -11,8 +11,9 @@ CleanSlate recursively examines directories to find and optionally remove build 
 - Calculates artifact sizes and shows each project's age
 - Filters artifacts by age or modification date
 - Excludes selected directories by name
-- Optionally deletes identified artifacts
-- Colorized output
+- Offers to delete what it found when run in a terminal, and prints a copyable command otherwise
+- Reports artifacts it kept because their version-control status could not be determined
+- Colorized output, controllable with `--color` and the `NO_COLOR` convention
 
 ## Supported Languages
 
@@ -45,9 +46,10 @@ CleanSlate loads its artifact patterns from `artifacts.toml`.
    - Example: `tmp` matches any directory named `tmp` anywhere in the tree
    - Used for: `node_modules`, `__pycache__`, `tmp`, `logs`, `.DS_Store`, etc.
 
-3. **Wildcard patterns**: Simple glob matching
+3. **Wildcard patterns**: Glob matching
    - Example: `*.pyc` matches any file ending in `.pyc`
    - Example: `yarn-*.log` matches `yarn-debug.log`, `yarn-error.log`, etc.
+   - Example: `cmake-build-*-debug` matches `cmake-build-x86_64-debug`; several wildcards in one pattern are supported
 
 ### Project Root Detection
 
@@ -56,6 +58,14 @@ CleanSlate determines project roots by looking for:
 - `pyproject.toml` (Python)
 - `package.json` (JavaScript/Node)
 - `go.mod` (Go)
+- `Gemfile` (Ruby)
+- `pom.xml` (Java/Maven)
+- `build.gradle`, `build.gradle.kts` (Java/Gradle)
+- `CMakeLists.txt` (C/C++)
+- `pubspec.yaml` (Dart/Flutter)
+- `Package.swift` (Swift)
+- `composer.json` (PHP)
+- `mix.exs` (Elixir)
 - `.git` (Git repository)
 - `.jj` (Jujutsu repository)
 
@@ -187,6 +197,14 @@ When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) 
 If stdout, stdin, or stderr is redirected (for example, `cleanslate > report.txt`), a plain scan does not prompt; it prints the `To delete: cleanslate --delete ...` hint instead so the report remains scriptable. Use `--dry-run` to preview the deletion set without being prompted.
 
 When `--delete` is used without `--yes`, CleanSlate still requires an interactive session (both stdin and stderr are TTYs) and refuses to run otherwise, rather than deleting silently. Use `--delete --yes` to skip the prompt and delete everything that matched.
+
+## Exit Codes
+
+- `0` — the run completed, whether or not artifacts were found, and whether or not you chose to delete them
+- `1` — deletion was refused for want of a confirmation prompt, or one or more artifacts could not be removed
+- `2` — the command line was invalid
+
+Finding artifacts is not an error, so a scan that reports several gigabytes still exits `0`. To act on the result in a script, parse the report or use `--delete --yes`.
 
 ## License
 
