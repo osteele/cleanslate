@@ -20,7 +20,12 @@ impl TimeFilter {
     ) -> Result<Self> {
         let older_than = if let Some(duration_str) = older_than_str {
             let duration = parse_duration(duration_str)?;
-            let cutoff = SystemTime::now() - duration;
+            let cutoff = SystemTime::now().checked_sub(duration).with_context(|| {
+                format!(
+                    "Duration '{}' reaches before the representable past",
+                    duration_str
+                )
+            })?;
             Some(cutoff)
         } else {
             None
@@ -36,6 +41,19 @@ impl TimeFilter {
             older_than,
             modified_before,
         })
+    }
+
+    /// Build a filter directly from cutoffs. `older_than` keeps only files
+    /// strictly older than the cutoff; `modified_before` keeps only files
+    /// strictly earlier than the cutoff.
+    pub fn from_cutoffs(
+        older_than: Option<SystemTime>,
+        modified_before: Option<SystemTime>,
+    ) -> Self {
+        TimeFilter {
+            older_than,
+            modified_before,
+        }
     }
 
     /// Check if a file passes the time filter
@@ -140,23 +158,24 @@ pub fn parse_duration(duration_str: &str) -> Result<Duration> {
         )
     })?;
 
-    // Calculate total seconds based on unit
+    // Calculate total seconds based on unit, refusing values whose second count
+    // overflows u64 instead of panicking (debug) or wrapping (release)
     let seconds = match unit {
         None | Some("d") | Some("D") => {
             // Default to days for backward compatibility
-            value * 24 * 60 * 60
+            secs_per(value, 24 * 60 * 60, duration_str)?
         }
         Some("h") | Some("H") => {
             // Hours
-            value * 60 * 60
+            secs_per(value, 60 * 60, duration_str)?
         }
         Some("w") | Some("W") => {
             // Weeks (7 days)
-            value * 7 * 24 * 60 * 60
+            secs_per(value, 7 * 24 * 60 * 60, duration_str)?
         }
         Some("m") | Some("M") => {
             // Months (approximate as 30 days)
-            value * 30 * 24 * 60 * 60
+            secs_per(value, 30 * 24 * 60 * 60, duration_str)?
         }
         Some(unknown) => {
             anyhow::bail!(
@@ -167,6 +186,12 @@ pub fn parse_duration(duration_str: &str) -> Result<Duration> {
     };
 
     Ok(Duration::from_secs(seconds))
+}
+
+fn secs_per(value: u64, unit_secs: u64, duration_str: &str) -> Result<u64> {
+    value
+        .checked_mul(unit_secs)
+        .with_context(|| format!("Duration '{}' is too large to represent", duration_str))
 }
 
 #[cfg(test)]
@@ -259,6 +284,26 @@ mod tests {
     fn test_parse_duration_with_whitespace() {
         let duration = parse_duration("  15d  ").unwrap();
         assert_eq!(duration.as_secs(), 15 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn test_parse_duration_overflow_returns_error_not_panic() {
+        // u64::MAX weeks overflows the seconds computation; it must produce a
+        // clean error rather than panicking (debug) or wrapping (release).
+        let result = parse_duration("18446744073709551615w");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("too large to represent"));
+    }
+
+    #[test]
+    fn test_time_filter_older_than_reaching_before_epoch_returns_error() {
+        // ~58,000 years ago reaches before the SystemTime epoch; must be a
+        // clean error, not a panic in the now - duration subtraction.
+        let result = TimeFilter::from_args(Some("999999999999999d"), None);
+        assert!(result.is_err());
     }
 
     // ============ parse_date tests ============
@@ -364,6 +409,76 @@ mod tests {
         // A file from 1 day ago should fail (too new)
         let new_time = SystemTime::now() - Duration::from_secs(24 * 60 * 60);
         assert!(!filter.passes(new_time));
+    }
+
+    // ============ modified_before pass/fail contract tests ============
+
+    #[test]
+    fn test_time_filter_modified_before_passes_old_file() {
+        let cutoff = parse_date("2025-01-15").unwrap();
+        let filter = TimeFilter::from_args(None, Some("2025-01-15")).unwrap();
+        // Modified one second before the cutoff: passes.
+        let old_time = cutoff - Duration::from_secs(1);
+        assert!(filter.passes(old_time));
+    }
+
+    #[test]
+    fn test_time_filter_modified_before_fails_new_file() {
+        let cutoff = parse_date("2025-01-15").unwrap();
+        let filter = TimeFilter::from_args(None, Some("2025-01-15")).unwrap();
+        // Modified one second after the cutoff: fails.
+        let new_time = cutoff + Duration::from_secs(1);
+        assert!(!filter.passes(new_time));
+    }
+
+    /// The boundary itself counts as too recent: "modified before" is strict.
+    #[test]
+    fn test_time_filter_modified_before_boundary_is_excluded() {
+        let cutoff = parse_date("2025-01-15").unwrap();
+        let filter = TimeFilter::from_args(None, Some("2025-01-15")).unwrap();
+        assert!(!filter.passes(cutoff));
+    }
+
+    /// The older-than cutoff is likewise strict at the boundary.
+    #[test]
+    fn test_time_filter_older_than_boundary_is_excluded() {
+        let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+        let filter = TimeFilter::from_cutoffs(Some(cutoff), None);
+        assert!(!filter.passes(cutoff));
+        assert!(filter.passes(cutoff - Duration::from_secs(1)));
+    }
+
+    /// The modified-before boundary is strict when built from exact cutoffs.
+    #[test]
+    fn test_time_filter_modified_before_boundary_from_cutoffs() {
+        let cutoff = SystemTime::now() - Duration::from_secs(7 * 24 * 60 * 60);
+        let filter = TimeFilter::from_cutoffs(None, Some(cutoff));
+        assert!(!filter.passes(cutoff));
+        assert!(filter.passes(cutoff - Duration::from_secs(1)));
+    }
+
+    /// With both filters active, an artifact must pass both (README: "an
+    /// artifact must pass both filters"). Covers each region: passes both,
+    /// fails only the age cutoff, fails only the date cutoff, fails both.
+    #[test]
+    fn test_time_filter_both_filters_require_both_to_pass() {
+        let now = SystemTime::now();
+        let age_cutoff = now - Duration::from_secs(7 * 24 * 60 * 60);
+
+        // Date cutoff older than the age cutoff: between them, only the date
+        // filter fails.
+        let date_cutoff_far = now - Duration::from_secs(30 * 24 * 60 * 60);
+        let filter = TimeFilter::from_cutoffs(Some(age_cutoff), Some(date_cutoff_far));
+        assert!(filter.passes(date_cutoff_far - Duration::from_secs(24 * 60 * 60))); // passes both
+        assert!(!filter.passes(now - Duration::from_secs(14 * 24 * 60 * 60))); // fails date only
+        assert!(!filter.passes(now - Duration::from_secs(24 * 60 * 60))); // fails both
+
+        // Date cutoff newer than the age cutoff: between them, only the age
+        // filter fails.
+        let date_cutoff_near = now - Duration::from_secs(24 * 60 * 60);
+        let filter = TimeFilter::from_cutoffs(Some(age_cutoff), Some(date_cutoff_near));
+        assert!(!filter.passes(now - Duration::from_secs(3 * 24 * 60 * 60))); // fails age only
+        assert!(filter.passes(now - Duration::from_secs(60 * 24 * 60 * 60))); // passes both
     }
 
     // ============ format_age tests ============

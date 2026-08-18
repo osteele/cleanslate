@@ -74,6 +74,9 @@ fn make_file_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
 
 fn remove_recreatable_dir(path: &Path) -> io::Result<()> {
     match fs::remove_dir_all(path) {
+        // A vanished path is already in the desired state; treating it as an
+        // error would turn an overlapping removal into a false failure.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             make_tree_removable(path)?;
             fs::remove_dir_all(path)
@@ -82,47 +85,82 @@ fn remove_recreatable_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Outcome of attempting to remove one file or directory artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovalOutcome {
+    /// Removed by this run.
+    Deleted,
+    /// Already gone before this run attempted it (e.g. an enclosing artifact
+    /// that contained it was removed first). Not an error, and its bytes were
+    /// not freed by this entry.
+    AlreadyGone,
+    /// Removal was attempted and failed.
+    Failed,
+}
+
 /// Remove a single file artifact, logging per-file errors.
-fn remove_file_artifact(path: &Path, verbose: bool) -> bool {
+fn remove_file_artifact(path: &Path, verbose: bool) -> RemovalOutcome {
     match fs::remove_file(path) {
         Ok(_) => {
             if verbose {
                 println!("Removed: {}", path.display());
             }
-            true
+            RemovalOutcome::Deleted
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if verbose {
+                println!("Already gone: {}", path.display());
+            }
+            RemovalOutcome::AlreadyGone
         }
         Err(err) => {
             eprintln!("Error removing {}: {}. Skipping.", path.display(), err);
-            false
+            RemovalOutcome::Failed
         }
     }
 }
 
 /// Remove a recreatable (Category 2) directory artifact.
-fn remove_recreatable_artifact(path: &Path, verbose: bool) -> bool {
+fn remove_recreatable_artifact(path: &Path, verbose: bool) -> RemovalOutcome {
     match remove_recreatable_dir(path) {
         Ok(_) => {
             if verbose {
                 println!("Removed directory: {}", path.display());
             }
-            true
+            RemovalOutcome::Deleted
         }
         Err(err) => {
             eprintln!("Error removing {}: {}", path.display(), err);
-            false
+            RemovalOutcome::Failed
         }
     }
 }
 
+/// Outcome of removing the untracked files of a Category 3 (mixed) directory.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Category3Outcome {
+    deleted: usize,
+    already_gone: usize,
+    failed: usize,
+}
+
+impl Category3Outcome {
+    fn any_target_processed(&self) -> bool {
+        self.deleted + self.already_gone > 0
+    }
+}
+
 /// Remove a Category 3 (mixed) directory artifact by removing its untracked files.
-fn remove_category3_artifact(files: &[PathBuf], verbose: bool) -> bool {
-    let mut removed = false;
+fn remove_category3_artifact(files: &[PathBuf], verbose: bool) -> Category3Outcome {
+    let mut outcome = Category3Outcome::default();
     for file_path in files {
-        if remove_file_artifact(file_path, verbose) {
-            removed = true;
+        match remove_file_artifact(file_path, verbose) {
+            RemovalOutcome::Deleted => outcome.deleted += 1,
+            RemovalOutcome::AlreadyGone => outcome.already_gone += 1,
+            RemovalOutcome::Failed => outcome.failed += 1,
         }
     }
-    removed
+    outcome
 }
 
 /// Execute the deletion plan: remove artifacts belonging to the selected projects,
@@ -143,20 +181,54 @@ pub fn execute_plan(
             if entry.time_filtered {
                 continue;
             }
-            entry.removed = if entry.path.is_dir() {
+            if entry.path.is_dir() {
                 if entry.files.is_empty() {
-                    remove_recreatable_artifact(&entry.path, verbose)
+                    match remove_recreatable_artifact(&entry.path, verbose) {
+                        RemovalOutcome::Deleted => {
+                            entry.removed = true;
+                            summary.artifacts_removed += 1;
+                            summary.bytes_removed += entry.size;
+                        }
+                        RemovalOutcome::AlreadyGone => {
+                            entry.removed = true;
+                            summary.artifacts_removed += 1;
+                        }
+                        RemovalOutcome::Failed => {
+                            entry.removed = false;
+                            summary.failures += 1;
+                        }
+                    }
                 } else {
-                    remove_category3_artifact(&entry.files, verbose)
+                    let outcome = remove_category3_artifact(&entry.files, verbose);
+                    summary.failures += outcome.failed;
+                    // The entry counts as removed only when every target file is
+                    // gone; partial failures leave it in place for reporting.
+                    entry.removed = outcome.failed == 0 && outcome.any_target_processed();
+                    if entry.removed {
+                        summary.artifacts_removed += 1;
+                        // Bytes are credited only when this run deleted at least
+                        // one file; fully-already-gone entries were freed elsewhere.
+                        if outcome.deleted > 0 {
+                            summary.bytes_removed += entry.size;
+                        }
+                    }
                 }
             } else {
-                remove_file_artifact(&entry.path, verbose)
-            };
-            if entry.removed {
-                summary.artifacts_removed += 1;
-                summary.bytes_removed += entry.size;
-            } else {
-                summary.failures += 1;
+                match remove_file_artifact(&entry.path, verbose) {
+                    RemovalOutcome::Deleted => {
+                        entry.removed = true;
+                        summary.artifacts_removed += 1;
+                        summary.bytes_removed += entry.size;
+                    }
+                    RemovalOutcome::AlreadyGone => {
+                        entry.removed = true;
+                        summary.artifacts_removed += 1;
+                    }
+                    RemovalOutcome::Failed => {
+                        entry.removed = false;
+                        summary.failures += 1;
+                    }
+                }
             }
         }
     }

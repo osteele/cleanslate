@@ -4,10 +4,6 @@ This document outlines planned improvements and future features for CleanSlate.
 
 ## Version Control Safety Enhancements
 
-### Completed ✅
-- Skip files tracked in Git
-- Skip files tracked in Jujutsu (jj)
-
 ### Future Improvements
 - Cache VCS tracking status for performance
 - Add `--ignore-vcs` flag to bypass VCS checks (for advanced users)
@@ -22,7 +18,6 @@ This document outlines planned improvements and future features for CleanSlate.
 - **Smart monorepo detection**: Identify monorepo patterns (workspace configs, lerna.json, pnpm-workspace.yaml, etc.)
 - **Workspace-aware scanning**: Understand workspace roots vs package roots
 - **Configurable depth limits**: Allow users to specify how deep to scan in monorepos
-- **Parallel processing**: Speed up scanning of large monorepos with parallel workers
 
 ## Pattern System Enhancements
 
@@ -34,7 +29,9 @@ This document outlines planned improvements and future features for CleanSlate.
 
 ## Aggressive Cleanup Mode
 
-### Planned Feature: `--aggressive` Flag
+`--aggressive` exists (small/trivial files such as `.DS_Store`, `Thumbs.db`).
+
+### Possible Extensions
 
 Safely remove additional files that might be useful for recovery:
 
@@ -55,14 +52,10 @@ cleanslate clean-caches     # Clean only cache directories (preserve build outpu
 
 ## Performance Improvements
 
-### Completed ✅
-- **Parallel directory scanning**: ✅ Implemented inter-project parallelism with rayon
-- **Batch VCS checks**: ✅ Implemented spot-check and batch-check optimizations
-- **Three-tier directory categorization**: ✅ VCS internals, recreatable dirs, other dirs
-
 ### Current Performance Characteristics
 - Parallel project scanning (rayon work-stealing thread pool)
-- Optimized VCS checks (O(D) instead of O(N) where D=directories, N=files)
+- One batch VCS call per project (spot-check and batch-check optimizations)
+- Three-tier directory categorization: VCS internals, recreatable dirs, other dirs
 - Results collected and displayed after all scanning completes
 
 ### Planned Optimizations
@@ -155,11 +148,11 @@ cleanslate clean-caches     # Clean only cache directories (preserve build outpu
 ## Testing
 
 ### Current Coverage
-- Basic pattern matching tests
-- Project root detection tests
+- Pattern matching and project root detection tests
+- CLI integration tests (assert_cmd) covering deletion, prompts, output formats, and exit codes
+- Scanner/VCS-batching tests against real Git repositories
 
 ### Planned Improvements
-- Integration tests with real project structures
 - Performance benchmarks
 - Cross-platform testing automation
 - Regression test suite with real-world repositories
@@ -171,7 +164,6 @@ cleanslate clean-caches     # Clean only cache directories (preserve build outpu
 - Migration guides (from other cleanup tools)
 - Video tutorials
 - FAQ section
-- Architecture documentation
 
 ## Community Features
 

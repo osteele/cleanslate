@@ -29,4 +29,4 @@ pub use scanner::{
     ScanOptions, ScanResult, ScanStats, TimeFilterContext,
 };
 pub use time::{format_age, TimeFilter};
-pub use vcs::{detect_vcs, VcsCheckResult, VcsType};
+pub use vcs::{detect_vcs, VcsType};

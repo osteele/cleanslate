@@ -171,6 +171,7 @@ fn scan_for_artifacts(
         combined_stats.passed_time_filter += result.stats.passed_time_filter;
         combined_stats.excluded_by_time += result.stats.excluded_by_time;
         combined_stats.vcs_check_failures += result.stats.vcs_check_failures;
+        combined_stats.vcs_batch_call_count += result.stats.vcs_batch_call_count;
         for (project_path, project_report) in result.projects {
             projects
                 .entry(project_path)
@@ -1004,6 +1005,28 @@ fn main() -> Result<()> {
         eprintln!("cleanslate: --calculate-sizes is now the default; the flag is ignored");
     }
     let calculate_sizes = !args.no_sizes;
+
+    // Validate time-filter arguments before doing any work so an invalid
+    // command line exits 2 (see Exit Codes in README) rather than 1 mid-scan.
+    if let Some(value) = args.older_than.as_deref() {
+        if let Err(err) = cleanslate::time::parse_duration(value) {
+            eprintln!(
+                "error: invalid value '{}' for '--older-than': {}",
+                value, err
+            );
+            std::process::exit(2);
+        }
+    }
+    if let Some(value) = args.modified_before.as_deref() {
+        if let Err(err) = cleanslate::time::parse_date(value) {
+            eprintln!(
+                "error: invalid value '{}' for '--modified-before': {}",
+                value, err
+            );
+            std::process::exit(2);
+        }
+    }
+
     // Captured once so every displayed age is relative to the same instant
     let now = SystemTime::now();
 

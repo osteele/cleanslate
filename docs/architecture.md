@@ -235,7 +235,7 @@ If the single project-level VCS call fails (for example, a corrupted `.git` dire
 After removing files, directories may become empty. The cleanup pass:
 1. Collects all parent directories of removed files/directories
 2. Sorts directories by depth (deepest first)
-3. Checks if directory is empty OR only contains `.DS_Store`/`Thumbs.db`
+3. Checks whether the directory is genuinely empty
 4. Removes empty directories
 5. Recursively removes parent directories that become empty
 

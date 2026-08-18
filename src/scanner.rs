@@ -536,7 +536,7 @@ fn handle_file_artifact(
 /// is found, it sends it to the channel and doesn't descend into that project's subdirectories.
 fn discover_projects_streaming(
     start_path: &Path,
-    _patterns: &[ArtifactPattern],
+    patterns: &[ArtifactPattern],
     exclude: &[String],
     sender: Sender<PathBuf>,
     progress: Arc<ProgressBar>,
@@ -556,6 +556,7 @@ fn discover_projects_streaming(
     let entries_scanned_clone = Arc::clone(&entries_scanned);
     let progress_clone = Arc::clone(&progress);
     let exclude_clone = exclude.to_vec();
+    let patterns_clone = patterns.to_vec();
     let start_path_buf = start_path.to_path_buf();
 
     let walker = WalkBuilder::new(start_path)
@@ -592,6 +593,16 @@ fn discover_projects_streaming(
             // Skip user-excluded directories
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if should_exclude_path(path, &exclude_clone) {
+                    return false;
+                }
+
+                // Never look for projects inside artifact directories: the scan
+                // phase handles a matched artifact directory as one unit
+                // (including its nested-VCS safety check). Descending here would
+                // discover the packages inside (every installed npm package has
+                // a package.json), suppress the no-projects fallback, and leave
+                // the enclosing artifact directory itself unreported.
+                if path != start_path_buf && matching_pattern(path, &patterns_clone).is_some() {
                     return false;
                 }
 

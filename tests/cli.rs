@@ -472,6 +472,547 @@ fn test_selective_deletion_pass_only_removes_selected_projects() {
     assert!(!b_removed);
 }
 
+/// Regression test: when only some files of a Category 3 artifact can be
+/// removed, the failures must be counted (and drive the exit code), not
+/// swallowed because one file succeeded.
+#[cfg(unix)]
+#[test]
+fn test_category3_partial_failures_are_counted() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    let file_a = dist.join("a.txt");
+    let file_b = dist.join("b.txt");
+    fs::write(&file_a, "a").unwrap();
+    fs::write(&file_b, "b").unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: dist.clone(),
+                size: 2,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: vec![file_a.clone(), file_b.clone()],
+            }],
+        },
+    );
+
+    // A read-only dist directory makes both file removals fail.
+    fs::set_permissions(&dist, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    fs::set_permissions(&dist, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(summary.failures, 2, "both failed removals must be counted");
+    assert_eq!(summary.artifacts_removed, 0);
+    assert_eq!(summary.bytes_removed, 0);
+    assert!(!projects[&project_root].artifacts[0].removed);
+}
+
+/// Regression test: files that vanished between the scan and the deletion run
+/// (e.g. an enclosing artifact was removed first) are already gone, not
+/// failures — the run must not report failures or claim their bytes.
+#[test]
+fn test_category3_already_gone_files_are_not_failures() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    let kept = dist.join("kept.txt");
+    let gone = dist.join("gone.txt");
+    fs::write(&kept, "k").unwrap();
+    fs::write(&gone, "g").unwrap();
+    // The enclosing artifact directory is removed before this entry executes.
+    fs::remove_dir_all(&dist).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                // Path no longer exists: execute_plan treats it as a file entry
+                // and must report already-gone rather than failure.
+                path: gone.clone(),
+                size: 1,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: Vec::new(),
+            }],
+        },
+    );
+    let _ = kept;
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.failures, 0, "an already-gone file is not a failure");
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(
+        summary.bytes_removed, 0,
+        "bytes must not be credited for a file this run did not delete"
+    );
+    assert!(projects[&project_root].artifacts[0].removed);
+}
+
+/// Invalid time-filter values are command-line errors and must exit 2, as
+/// documented under Exit Codes in the README.
+#[test]
+fn test_invalid_time_filter_values_exit_2() {
+    let dir = setup_test_directory();
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd.arg(dir.path()).arg("--older-than").arg("15x").assert();
+    assert.failure().code(2).stderr(predicate::str::contains(
+        "invalid value '15x' for '--older-than'",
+    ));
+    assert!(dir.path().join("node_modules").exists());
+
+    let mut cmd = Command::cargo_bin("cleanslate").unwrap();
+    let assert = cmd
+        .arg(dir.path())
+        .arg("--modified-before")
+        .arg("01-15-2025")
+        .assert();
+    assert.failure().code(2).stderr(predicate::str::contains(
+        "invalid value '01-15-2025' for '--modified-before'",
+    ));
+    assert!(dir.path().join("target").exists());
+}
+
+/// A recreatable (Category 2) directory artifact reports its removal in the
+/// summary: one artifact removed, its full size credited.
+#[test]
+fn test_category2_removal_is_summarized_with_bytes() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let target = dir.path().join("target");
+    fs::create_dir_all(&target).unwrap();
+    fs::write(target.join("debug.txt"), "debug").unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: target.clone(),
+                size: 5,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Rust".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert!(!target.exists());
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.failures, 0);
+    assert_eq!(summary.bytes_removed, 5);
+    assert!(projects[&project_root].artifacts[0].removed);
+}
+
+/// A Category 3 artifact whose files were partly deleted and partly already
+/// gone counts as removed, with its bytes credited by this run.
+#[test]
+fn test_category3_mixed_deleted_and_gone_counts_as_removed_with_bytes() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    let existing = dist.join("a.txt");
+    fs::write(&existing, "a").unwrap();
+    let gone = dist.join("gone.txt");
+    fs::write(&gone, "g").unwrap();
+    fs::remove_file(&gone).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: dist.clone(),
+                size: 2,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: vec![existing.clone(), gone.clone()],
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.failures, 0);
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.bytes_removed, 2);
+    assert!(projects[&project_root].artifacts[0].removed);
+    assert!(!existing.exists());
+}
+
+/// A Category 3 artifact whose files are all already gone still counts as
+/// removed (idempotent), but no bytes are credited for this run.
+#[test]
+fn test_category3_all_files_gone_counts_as_removed_without_bytes() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    let gone_a = dist.join("a.txt");
+    let gone_b = dist.join("b.txt");
+    fs::write(&gone_a, "a").unwrap();
+    fs::write(&gone_b, "b").unwrap();
+    fs::remove_file(&gone_a).unwrap();
+    fs::remove_file(&gone_b).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: dist.clone(),
+                size: 2,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: vec![gone_a.clone(), gone_b.clone()],
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.failures, 0);
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.bytes_removed, 0);
+    assert!(projects[&project_root].artifacts[0].removed);
+}
+
+/// A Category 3 artifact where one file is removed and another fails is NOT
+/// removed overall: the failure is counted and no artifact/bytes are credited.
+#[test]
+fn test_category3_partial_success_with_failure_is_not_removed() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let dist = dir.path().join("dist");
+    fs::create_dir_all(&dist).unwrap();
+    let removable = dist.join("a.txt");
+    fs::write(&removable, "a").unwrap();
+    // A non-empty directory cannot be removed by remove_file: a stand-in for
+    // any per-file failure that leaves the artifact directory in place.
+    let failing = dist.join("subdir");
+    fs::create_dir_all(&failing).unwrap();
+    fs::write(failing.join("keep.txt"), "keep").unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: dist.clone(),
+                size: 2,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Build,
+                files: vec![removable.clone(), failing.clone()],
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.failures, 1);
+    assert_eq!(summary.artifacts_removed, 0);
+    assert_eq!(summary.bytes_removed, 0);
+    assert!(!projects[&project_root].artifacts[0].removed);
+    assert!(!removable.exists(), "the removable file is still deleted");
+    assert!(failing.exists(), "the failing target is untouched");
+}
+
+/// A file artifact whose removal fails is counted as a failure.
+#[cfg(unix)]
+#[test]
+fn test_file_artifact_failure_is_counted() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let log_dir = dir.path().join("log");
+    fs::create_dir_all(&log_dir).unwrap();
+    let file = log_dir.join("stale.log");
+    fs::write(&file, "log").unwrap();
+    // A read-only parent directory makes remove_file fail.
+    fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: file.clone(),
+                size: 3,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Logs,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    fs::set_permissions(&log_dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(summary.failures, 1);
+    assert_eq!(summary.artifacts_removed, 0);
+    assert_eq!(summary.bytes_removed, 0);
+    assert!(!projects[&project_root].artifacts[0].removed);
+    assert!(file.exists());
+}
+
+/// A successfully deleted file artifact credits its bytes to the summary.
+#[test]
+fn test_file_artifact_removal_credits_bytes() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let file = dir.path().join("stale.log");
+    fs::write(&file, "abc").unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: file.clone(),
+                size: 3,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Logs,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.bytes_removed, 3);
+    assert_eq!(summary.failures, 0);
+    assert!(!file.exists());
+}
+
+/// After removing a file artifact, directories left empty up to (but not
+/// including) the project root are cleaned up; non-empty ones remain.
+#[test]
+fn test_empty_directories_are_cleaned_up_to_project_root() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    // Build entry paths from the canonicalized root so they share the
+    // project_root prefix (the real scanner canonicalizes both consistently).
+    let project_root = dir.path().canonicalize().unwrap();
+    let nested = project_root.join("dist/a");
+    fs::create_dir_all(&nested).unwrap();
+    let file = nested.join("stale.log");
+    fs::write(&file, "log").unwrap();
+    // A sibling directory keeps dist non-empty at the top level.
+    let kept_dir = project_root.join("dist/b");
+    fs::create_dir_all(&kept_dir).unwrap();
+
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: file.clone(),
+                size: 3,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Logs,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    assert_eq!(summary.failures, 0);
+    assert!(!file.exists());
+    // dist/a became empty and is removed; dist still contains b and remains.
+    assert!(!nested.exists(), "empty parent dist/a should be removed");
+    assert!(
+        dir.path().join("dist").exists(),
+        "non-empty dist must remain"
+    );
+    assert!(kept_dir.exists());
+    assert!(
+        project_root.exists(),
+        "the project root itself must never be removed"
+    );
+}
+
+/// A recreatable directory that lacks the owner-write bit (like Go module
+/// caches, but here 0o500) gets its permissions repaired before removal.
+#[cfg(unix)]
+#[test]
+fn test_directory_missing_owner_write_bit_is_still_removed() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("go.mod"), "module example.com/project\n").unwrap();
+    let cache = dir.path().join(".gomodcache");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("source.go"), "package p\n").unwrap();
+    // 0o500 (r-x): remove_dir_all cannot unlink from it, and unlike 0o555 the
+    // permission-repair guard's `&` check is what detects the missing bit.
+    fs::set_permissions(&cache, fs::Permissions::from_mode(0o500)).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: cache.clone(),
+                size: 12,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Go".to_string(),
+                artifact_type: ArtifactType::Cache,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    if cache.exists() {
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert!(!cache.exists(), "cache directory should have been removed");
+    assert_eq!(summary.artifacts_removed, 1);
+    assert_eq!(summary.failures, 0);
+}
+
+/// A recreatable directory that cannot be removed even after the permission
+/// retry (its read-only PARENT blocks the unlink, and the retry only repairs
+/// the artifact directory itself) is counted as a failure.
+#[cfg(unix)]
+#[test]
+fn test_category2_removal_failure_is_counted() {
+    use cleanslate::{execute_plan, ArtifactEntry, ArtifactType, ProjectReport};
+    use std::collections::{HashMap, HashSet};
+
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    let ro = dir.path().join("ro");
+    fs::create_dir_all(&ro).unwrap();
+    let artifact = ro.join("node_modules");
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("package.json"), "{}").unwrap();
+    // Only the artifact's parent is read-only: chmod repair inside the
+    // artifact cannot fix that, so removal fails.
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let project_root = dir.path().canonicalize().unwrap();
+    let mut projects: HashMap<std::path::PathBuf, ProjectReport> = HashMap::new();
+    projects.insert(
+        project_root.clone(),
+        ProjectReport {
+            artifacts: vec![ArtifactEntry {
+                path: artifact.clone(),
+                size: 2,
+                removed: false,
+                modified: None,
+                time_filtered: false,
+                language_name: "Test".to_string(),
+                artifact_type: ArtifactType::Dependency,
+                files: Vec::new(),
+            }],
+        },
+    );
+
+    let selected: HashSet<std::path::PathBuf> = [project_root.clone()].into_iter().collect();
+    let summary = execute_plan(&mut projects, &selected, false);
+
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(summary.failures, 1);
+    assert_eq!(summary.artifacts_removed, 0);
+    assert_eq!(summary.bytes_removed, 0);
+    assert!(!projects[&project_root].artifacts[0].removed);
+    assert!(artifact.exists(), "the artifact directory must survive");
+}
+
 /// Regression test: --delete --yes must print a deletion summary, not redisplay
 /// the full scan table.
 #[test]
