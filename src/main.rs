@@ -429,7 +429,7 @@ fn display_table_format(report: &Report) {
                 (name, a.size)
             })
             .collect();
-        artifacts_with_size.sort_by(|a, b| b.1.cmp(&a.1)); // Sort by size desc
+        artifacts_with_size.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
 
         // Build What column string with truncation
         let mut what_parts = Vec::new();
@@ -638,7 +638,7 @@ fn display_list_format(report: &Report) {
 
         // Sort languages alphabetically
         let mut languages: Vec<_> = language_summary.into_iter().collect();
-        languages.sort_by(|a, b| a.0.cmp(&b.0));
+        languages.sort_by_key(|(language, _)| language.clone());
 
         for (language, (size, artifacts)) in languages {
             let artifacts_str = artifacts.join(", ");
@@ -769,7 +769,7 @@ fn select_projects_interactively(
             (path.clone(), label)
         })
         .collect();
-    project_items.sort_by(|a, b| a.1.cmp(&b.1));
+    project_items.sort_by_key(|(_, label)| label.clone());
 
     let prompt_options: Vec<String> = project_items
         .iter()
