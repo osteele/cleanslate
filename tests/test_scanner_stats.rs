@@ -276,12 +276,18 @@ fn discovery_attributes_artifacts_to_nested_project_only() {
         result.projects.keys()
     );
     assert!(result.projects.contains_key(&canonical_proj));
-    let artifacts = &result.projects[&canonical_proj].artifacts;
-    assert_eq!(artifacts.len(), 2);
-    assert_eq!(artifacts[0].path, canonical_proj.join("__pycache__"));
+    let mut artifact_paths: Vec<_> = result.projects[&canonical_proj]
+        .artifacts
+        .iter()
+        .map(|a| a.path.clone())
+        .collect();
+    artifact_paths.sort();
     assert_eq!(
-        artifacts[1].path,
-        canonical_proj.join("sub/inner/__pycache__")
+        artifact_paths,
+        vec![
+            canonical_proj.join("__pycache__"),
+            canonical_proj.join("sub/inner/__pycache__"),
+        ]
     );
 }
 
