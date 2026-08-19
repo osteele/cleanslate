@@ -577,7 +577,7 @@ fn discover_projects_streaming(
             {
                 let mut count = entries_scanned_clone.lock().unwrap();
                 *count += 1;
-                if *count % 100 == 0 {
+                if (*count).is_multiple_of(100) {
                     progress_clone
                         .set_message(format!("Discovering projects: {} entries scanned", count));
                 }

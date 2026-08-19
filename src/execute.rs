@@ -62,7 +62,11 @@ fn make_file_removable(_path: &Path, _metadata: &fs::Metadata) -> io::Result<()>
     Ok(())
 }
 
+// On Windows the read-only attribute is the only permission bit; clearing it
+// is exactly the intent here. The lint's Unix world-writable concern cannot
+// apply — this function only exists on non-Unix targets.
 #[cfg(not(unix))]
+#[allow(clippy::permissions_set_readonly_false)]
 fn make_file_removable(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     let mut permissions = metadata.permissions();
     if permissions.readonly() {
