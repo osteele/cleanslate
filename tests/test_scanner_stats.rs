@@ -400,17 +400,20 @@ fn git_tracked_files_with_quoted_names_are_kept() {
         .output()
         .expect("git config user.name failed");
 
-    // Tracked files whose `git ls-files` output is quoted.
-    let quoted_name = "quote\"name.aux";
+    // Tracked files whose `git ls-files` output is quoted. `"` is not a legal
+    // filename character on Windows, so the quote-path half is unix-only; the
+    // non-ASCII half (quoted under the default core.quotePath) runs everywhere.
     let unicode_name = "café.aux";
-    fs::write(dir.path().join(quoted_name), "tracked").unwrap();
     fs::write(dir.path().join(unicode_name), "tracked").unwrap();
-    Command::new("git")
-        .arg("add")
-        .arg("--")
-        .arg(quoted_name)
-        .arg(unicode_name)
-        .current_dir(dir.path())
+    #[cfg(not(windows))]
+    let quoted_name = "quote\"name.aux";
+    #[cfg(not(windows))]
+    fs::write(dir.path().join(quoted_name), "tracked").unwrap();
+    let mut add = Command::new("git");
+    add.arg("add").arg("--").arg(unicode_name);
+    #[cfg(not(windows))]
+    add.arg(quoted_name);
+    add.current_dir(dir.path())
         .output()
         .expect("git add failed");
     Command::new("git")
@@ -451,8 +454,15 @@ fn git_tracked_files_with_quoted_names_are_kept() {
         reported_names
     );
     assert!(
-        reported_names.iter().any(|n| n == "untracked.aux"),
-        "untracked artifact should be reported, got: {:?}",
+        !reported_names
+            .iter()
+            .any(|n| n.contains("name.aux") && n != "untracked.aux"),
+        "tracked quoted-path files must not be reported for removal, got: {:?}",
+        reported_names
+    );
+    assert!(
+        !reported_names.iter().any(|n| n == "café.aux"),
+        "tracked non-ASCII (quotePath-quoted) file must not be reported, got: {:?}",
         reported_names
     );
 }
