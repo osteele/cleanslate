@@ -188,17 +188,19 @@ When the output is a terminal, a plain scan ends by offering to delete the same 
 
 ## Interactive Deletion
 
-When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) and at least one removable artifact is found, CleanSlate displays the report and then offers to delete the artifacts it found:
+When a plain scan is run in a terminal (stdout, stdin, and stderr are all TTYs) and it found artifacts that are removable — or that an active time filter is holding back — CleanSlate displays the report and then offers to delete the artifacts it found:
 
 ```
-Delete 12 artifact(s) across 3 project(s), 4.2 GiB — yes/no/choose/quit [y/N/c/q]?
+Delete 12 artifact(s) across 3 project(s), 4.2 GiB — yes/no/choose/filter/quit [y/N/c/f/q]?
 ```
 
 The size clause is omitted under `--no-sizes`. A single keypress answers it; no `Enter` is needed. The capital `N` marks the default.
 
 - `y` — deletes every project in the plan, exactly as `--delete --yes` does.
-- `n`, `q`, `Enter`, `Esc`, or `Ctrl-C` — declines. Prints "No artifacts deleted." and exits with code 0 without deleting anything.
-- `c` — opens the per-project multi-select, listing every project with all pre-selected. Press `Space` to toggle selection and `Enter` to confirm; `Esc` / `Ctrl-C` cancels. Whatever remains selected is deleted immediately with no second confirmation. Selecting nothing or canceling prints "No artifacts deleted." and exits with code 0.
+- `n`, `Enter`, `Esc`, or `Ctrl-C` — declines. Prints "No artifacts deleted." and exits with code 0 without deleting anything.
+- `q` — quits the app immediately, without deleting anything.
+- `c` — opens the per-project multi-select, listing every project with all pre-selected. Press `Space` to toggle selection and `Enter` to confirm; `Esc` / `Ctrl-C` cancels and returns to the prompt. Whatever remains selected is deleted immediately with no second confirmation.
+- `f` — changes the time filter. Enter a duration (`15d`, `2w`, `3m`, `48h`), a date (`YYYY-MM-DD`), or an empty line to remove the limit. CleanSlate rescans with the new cutoff and redisplays the report; a later deletion acts on the refreshed plan.
 
 Any other key is ignored and the prompt keeps waiting.
 

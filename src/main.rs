@@ -823,6 +823,76 @@ fn confirmation_prompt(
     }
 }
 
+/// Build the deletion prompt for the current plan, counting only artifacts the
+/// time filter did not exclude.
+fn deletion_prompt(projects: &HashMap<PathBuf, ProjectReport>, calculate_sizes: bool) -> String {
+    let artifact_count = projects
+        .values()
+        .flat_map(|report| &report.artifacts)
+        .filter(|artifact| !artifact.time_filtered)
+        .count();
+    let total_bytes = if calculate_sizes {
+        Some(
+            projects
+                .values()
+                .flat_map(|report| &report.artifacts)
+                .filter(|artifact| !artifact.time_filtered)
+                .map(|artifact| artifact.size)
+                .sum(),
+        )
+    } else {
+        None
+    };
+    confirmation_prompt(artifact_count, projects.len(), total_bytes)
+}
+
+/// Parse an interactively entered time-filter value into CLI-equivalent
+/// arguments: a duration ("15d", "2w") maps to `--older-than`, a date
+/// ("YYYY-MM-DD") maps to `--modified-before`, and an empty input clears the
+/// filter. The value is validated here so the prompt can reject typos.
+fn parse_filter_input(input: &str) -> Result<(Option<String>, Option<String>)> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok((None, None));
+    }
+    if input.contains('-') {
+        cleanslate::time::parse_date(input)?;
+        Ok((None, Some(input.to_string())))
+    } else {
+        cleanslate::time::parse_duration(input)?;
+        Ok((Some(input.to_string()), None))
+    }
+}
+
+/// Ask for a replacement time filter, validating the input before accepting
+/// it. Returns None when the prompt is canceled, leaving the filter unchanged.
+fn prompt_time_filter(
+    older_than: Option<&str>,
+    modified_before: Option<&str>,
+) -> Result<Option<(Option<String>, Option<String>)>> {
+    use inquire::validator::{ErrorMessage, Validation};
+    use inquire::Text;
+
+    let current = older_than.or(modified_before).unwrap_or("no limit");
+    let help = format!("current: {}", current);
+    let answer = Text::new(
+        "Only remove artifacts older than (e.g. 15d, 2w, 3m, 48h, or a date YYYY-MM-DD; empty = no limit):",
+    )
+    .with_help_message(&help)
+    .with_validator(|input: &str| match parse_filter_input(input) {
+        Ok(_) => Ok(Validation::Valid),
+        Err(err) => Ok(Validation::Invalid(ErrorMessage::Custom(err.to_string()))),
+    })
+    .prompt();
+
+    match answer {
+        Ok(input) => Ok(Some(parse_filter_input(&input)?)),
+        Err(inquire::InquireError::OperationCanceled)
+        | Err(inquire::InquireError::OperationInterrupted) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Print the outcome of a deletion run (instead of redisplaying the scan table)
 fn print_execution_summary(
     projects: &HashMap<PathBuf, ProjectReport>,
@@ -856,12 +926,16 @@ fn print_execution_summary(
     }
 }
 
-/// The three-way choice presented in the single interactive deletion prompt.
+/// The choices presented in the single-keypress interactive deletion prompt.
 #[derive(Debug, PartialEq, Eq)]
 enum InitialDeletionChoice {
     No,
     YesDeleteAll,
     ChooseProjects,
+    /// Enter a new time filter, rescan, and refresh the report.
+    ChangeFilter,
+    /// Exit immediately without deleting and without further output.
+    Quit,
 }
 
 impl std::fmt::Display for InitialDeletionChoice {
@@ -870,6 +944,8 @@ impl std::fmt::Display for InitialDeletionChoice {
             InitialDeletionChoice::No => write!(f, "No"),
             InitialDeletionChoice::YesDeleteAll => write!(f, "Yes, delete all"),
             InitialDeletionChoice::ChooseProjects => write!(f, "Choose projects…"),
+            InitialDeletionChoice::ChangeFilter => write!(f, "Change time filter…"),
+            InitialDeletionChoice::Quit => write!(f, "Quit"),
         }
     }
 }
@@ -879,10 +955,10 @@ impl std::fmt::Display for InitialDeletionChoice {
 fn key_action(key: &Key) -> Option<InitialDeletionChoice> {
     match key {
         Key::Char('y') | Key::Char('Y') => Some(InitialDeletionChoice::YesDeleteAll),
-        Key::Char('n') | Key::Char('N') | Key::Char('q') | Key::Char('Q') => {
-            Some(InitialDeletionChoice::No)
-        }
+        Key::Char('n') | Key::Char('N') => Some(InitialDeletionChoice::No),
         Key::Char('c') | Key::Char('C') => Some(InitialDeletionChoice::ChooseProjects),
+        Key::Char('f') | Key::Char('F') => Some(InitialDeletionChoice::ChangeFilter),
+        Key::Char('q') | Key::Char('Q') => Some(InitialDeletionChoice::Quit),
         Key::Enter | Key::Escape | Key::CtrlC => Some(InitialDeletionChoice::No),
         _ => None,
     }
@@ -890,7 +966,9 @@ fn key_action(key: &Key) -> Option<InitialDeletionChoice> {
 
 /// Ask which projects to clean, accepting a single keypress. Declining is the
 /// default, so it is also what an interrupted or unreadable terminal yields.
-fn prompt_initial_choice(prompt: &str) -> InitialDeletionChoice {
+/// `allow_filter` controls whether the time-filter key is accepted; the
+/// `--delete` path cannot rescan, so it leaves the key unbound.
+fn prompt_initial_choice(prompt: &str, allow_filter: bool) -> InitialDeletionChoice {
     let term = Term::stderr();
     // Without a terminal, read_key yields Key::Unknown forever rather than
     // blocking, so asking would spin instead of waiting for an answer.
@@ -898,7 +976,12 @@ fn prompt_initial_choice(prompt: &str) -> InitialDeletionChoice {
         return InitialDeletionChoice::No;
     }
 
-    let line = format!("{} — yes/no/choose/quit [y/N/c/q]? ", prompt);
+    let keys = if allow_filter {
+        "yes/no/choose/filter/quit [y/N/c/f/q]?"
+    } else {
+        "yes/no/choose/quit [y/N/c/q]?"
+    };
+    let line = format!("{} — {} ", prompt, keys);
     if term.write_str(&line).is_err() {
         return InitialDeletionChoice::No;
     }
@@ -909,6 +992,9 @@ fn prompt_initial_choice(prompt: &str) -> InitialDeletionChoice {
         match term.read_key_raw() {
             Ok(key) => {
                 if let Some(choice) = key_action(&key) {
+                    if choice == InitialDeletionChoice::ChangeFilter && !allow_filter {
+                        continue;
+                    }
                     break choice;
                 }
             }
@@ -944,26 +1030,15 @@ fn run_interactive_deletion(
     let selected = if yes {
         projects.keys().cloned().collect()
     } else {
-        let artifact_count = projects
-            .values()
-            .flat_map(|report| &report.artifacts)
-            .filter(|artifact| !artifact.time_filtered)
-            .count();
-        let total_bytes = if calculate_sizes {
-            Some(
-                projects
-                    .values()
-                    .flat_map(|report| &report.artifacts)
-                    .filter(|artifact| !artifact.time_filtered)
-                    .map(|artifact| artifact.size)
-                    .sum(),
-            )
-        } else {
-            None
-        };
-        let prompt = confirmation_prompt(artifact_count, projects.len(), total_bytes);
-        match prompt_initial_choice(&prompt) {
-            InitialDeletionChoice::No => return Ok(DeletionFlowOutcome::Cancelled),
+        let prompt = deletion_prompt(projects, calculate_sizes);
+        match prompt_initial_choice(&prompt, false) {
+            InitialDeletionChoice::No
+            | InitialDeletionChoice::Quit
+            // Unreachable: the filter key is only accepted when allow_filter
+            // is set, which the rescan-less --delete path does not do.
+            | InitialDeletionChoice::ChangeFilter => {
+                return Ok(DeletionFlowOutcome::Cancelled)
+            }
             InitialDeletionChoice::YesDeleteAll => projects.keys().cloned().collect(),
             InitialDeletionChoice::ChooseProjects => {
                 match select_projects_interactively(projects, unique_paths, calculate_sizes)? {
@@ -1050,7 +1125,7 @@ fn main() -> Result<()> {
         calculate_sizes,
         color,
     };
-    let (mut result, unique_paths) = scan_for_artifacts(
+    let (mut result, mut unique_paths) = scan_for_artifacts(
         &args.paths,
         options,
         args.aggressive,
@@ -1075,6 +1150,9 @@ fn main() -> Result<()> {
     // without the deletion hint. When running in a terminal, a plain scan can
     // also offer to enter the same interactive deletion path that --delete uses.
     let has_removable = has_removable_artifacts(&result.projects);
+    // A scan whose time filter excluded everything still gets a session: the
+    // filter prompt can relax the cutoff and rescan, revealing artifacts.
+    let can_adjust_filter = time_filter.is_active() && result.stats.total_found > 0;
 
     if !args.delete {
         display_results(&report, args.list);
@@ -1087,20 +1165,90 @@ fn main() -> Result<()> {
             std::io::stdout().is_terminal(),
             std::io::stdin().is_terminal(),
             std::io::stderr().is_terminal(),
-            has_removable,
+            has_removable || can_adjust_filter,
         ) {
-            match run_interactive_deletion(
-                &mut result.projects,
-                &unique_paths,
-                calculate_sizes,
-                args.yes,
-                args.verbose,
-            )? {
-                DeletionFlowOutcome::Cancelled => println!("No artifacts deleted."),
-                DeletionFlowOutcome::Deleted(summary) => {
-                    if summary.failures > 0 {
-                        std::process::exit(1);
+            let mut older_than = args.older_than.clone();
+            let mut modified_before = args.modified_before.clone();
+
+            // Interactive session: the prompt repeats until the user deletes,
+            // declines, or quits. Changing the time filter rescans with the new
+            // cutoff and refreshes the report, so deletion always acts on what
+            // the view currently shows.
+            let mut deleted_summary: Option<ExecutionSummary> = None;
+            'session: loop {
+                let prompt = deletion_prompt(&result.projects, calculate_sizes);
+                let selected: HashSet<PathBuf> = match prompt_initial_choice(&prompt, true) {
+                    InitialDeletionChoice::No => {
+                        println!("No artifacts deleted.");
+                        break 'session;
                     }
+                    InitialDeletionChoice::Quit => break 'session,
+                    InitialDeletionChoice::YesDeleteAll => {
+                        result.projects.keys().cloned().collect()
+                    }
+                    InitialDeletionChoice::ChooseProjects => {
+                        match select_projects_interactively(
+                            &result.projects,
+                            &unique_paths,
+                            calculate_sizes,
+                        )? {
+                            Some(selected) if !selected.is_empty() => selected,
+                            // Nothing selected or canceled: return to the prompt.
+                            _ => continue 'session,
+                        }
+                    }
+                    InitialDeletionChoice::ChangeFilter => {
+                        let Some((new_older_than, new_modified_before)) = prompt_time_filter(
+                            older_than.as_deref(),
+                            modified_before.as_deref(),
+                        )?
+                        else {
+                            // Canceled: keep the current filter and re-prompt.
+                            continue 'session;
+                        };
+                        older_than = new_older_than;
+                        modified_before = new_modified_before;
+
+                        let (new_result, new_paths) = scan_for_artifacts(
+                            &args.paths,
+                            options,
+                            args.aggressive,
+                            args.exclude.clone(),
+                            older_than.clone(),
+                            modified_before.clone(),
+                        )?;
+                        result = new_result;
+                        unique_paths = new_paths;
+
+                        let time_filter = TimeFilter::from_args(
+                            older_than.as_deref(),
+                            modified_before.as_deref(),
+                        )?;
+                        let report = Report {
+                            projects: &result.projects,
+                            unique_paths: &unique_paths,
+                            time_filter: &time_filter,
+                            total_bytes: result.total_bytes,
+                            stats: &result.stats,
+                            calculate_sizes,
+                            now,
+                        };
+                        display_results(&report, args.list);
+                        print_vcs_failure_notice(&result.stats, args.verbose);
+                        if !has_removable_artifacts(&result.projects) {
+                            println!("No artifacts pass the current time filter.");
+                        }
+                        continue 'session;
+                    }
+                };
+                let summary = execute_plan(&mut result.projects, &selected, args.verbose);
+                print_execution_summary(&result.projects, &selected, &summary, calculate_sizes);
+                deleted_summary = Some(summary);
+                break 'session;
+            }
+            if let Some(summary) = deleted_summary {
+                if summary.failures > 0 {
+                    std::process::exit(1);
                 }
             }
         } else if has_removable {
@@ -1146,8 +1294,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        confirmation_prompt, key_action, remove_overlapping_paths, should_offer_deletion,
-        should_refuse_non_interactive_delete, InitialDeletionChoice, Key,
+        confirmation_prompt, key_action, parse_filter_input, remove_overlapping_paths,
+        should_offer_deletion, should_refuse_non_interactive_delete, InitialDeletionChoice, Key,
     };
     use std::path::PathBuf;
 
@@ -1168,8 +1316,6 @@ mod tests {
         for key in [
             Key::Char('n'),
             Key::Char('N'),
-            Key::Char('q'),
-            Key::Char('Q'),
             Key::Enter,
             Key::Escape,
             Key::CtrlC,
@@ -1178,6 +1324,30 @@ mod tests {
                 key_action(&key),
                 Some(InitialDeletionChoice::No),
                 "{:?} should decline",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn q_quits() {
+        for key in [Key::Char('q'), Key::Char('Q')] {
+            assert_eq!(
+                key_action(&key),
+                Some(InitialDeletionChoice::Quit),
+                "{:?} should quit",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn f_changes_the_time_filter() {
+        for key in [Key::Char('f'), Key::Char('F')] {
+            assert_eq!(
+                key_action(&key),
+                Some(InitialDeletionChoice::ChangeFilter),
+                "{:?} should offer to change the time filter",
                 key
             );
         }
@@ -1218,6 +1388,36 @@ mod tests {
     fn confirmation_prompt_omits_size_without_calculated_sizes() {
         let prompt = confirmation_prompt(3, 2, None);
         assert_eq!(prompt, "Delete 3 artifact(s) across 2 project(s)");
+    }
+
+    #[test]
+    fn filter_input_duration_becomes_older_than() {
+        let (older_than, modified_before) = parse_filter_input("15d").unwrap();
+        assert_eq!(older_than.as_deref(), Some("15d"));
+        assert_eq!(modified_before, None);
+    }
+
+    #[test]
+    fn filter_input_date_becomes_modified_before() {
+        let (older_than, modified_before) = parse_filter_input("2025-01-15").unwrap();
+        assert_eq!(older_than, None);
+        assert_eq!(modified_before.as_deref(), Some("2025-01-15"));
+    }
+
+    #[test]
+    fn filter_input_empty_clears_the_filter() {
+        for input in ["", "   "] {
+            let (older_than, modified_before) = parse_filter_input(input).unwrap();
+            assert_eq!(older_than, None);
+            assert_eq!(modified_before, None);
+        }
+    }
+
+    #[test]
+    fn filter_input_rejects_invalid_values() {
+        assert!(parse_filter_input("abc").is_err());
+        assert!(parse_filter_input("15x").is_err());
+        assert!(parse_filter_input("2025-13-01").is_err());
     }
 
     #[test]
